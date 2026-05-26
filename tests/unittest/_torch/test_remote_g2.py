@@ -320,6 +320,55 @@ def test_source_registry_reports_first_missing_block_status():
     assert result.per_block_status[0].status == "missing"
 
 
+def test_source_registry_reports_promoted_primary_from_kv_classifier():
+    BLOCK_SIZE_BYTES = 4096
+    POOL_BASE_PTR = 0x1000_0000
+    WINDOW_SIZE = 4096
+    secondary_locations = {11: (42, 5)}
+    primary_hashes = {22}
+    secondary_lookups: list[int] = []
+    primary_lookups: list[int] = []
+
+    class FakeKv:
+        def find_and_pin_secondary_block_by_hash(self, block_hash, window_size):
+            secondary_lookups.append(int(block_hash))
+            assert int(window_size) == WINDOW_SIZE
+            return secondary_locations.get(int(block_hash))
+
+        def has_primary_block_by_hash(self, block_hash, window_size):
+            primary_lookups.append(int(block_hash))
+            assert int(window_size) == WINDOW_SIZE
+            return int(block_hash) in primary_hashes
+
+    registry = SourceG2DescriptorRegistry(
+        source_worker_id=7,
+        source_dp_rank=0,
+        source_generation=99,
+        clock_ms=lambda: 1_000,
+        acquire_pin=lambda record, lease_id: record.block_id,
+        release_pin=lambda _pin: None,
+        require_trtllm_pin=True,
+        kv=FakeKv(),
+        window_size=WINDOW_SIZE,
+        pool_id="host-pool-0",
+        pool_base_ptr=POOL_BASE_PTR,
+        block_size_bytes=BLOCK_SIZE_BYTES,
+        tier="host_pinned",
+    )
+
+    result = registry.resolve_and_lease(_plan())
+
+    assert result.reason == "ok"
+    assert result.lease_id is not None
+    assert [d.block_hash for d in result.descriptors] == [11]
+    assert [(s.block_hash, s.status) for s in result.per_block_status] == [
+        (11, "live"),
+        (22, "promoted_primary"),
+    ]
+    assert secondary_lookups == [11, 22]
+    assert primary_lookups == [22]
+
+
 def test_source_registry_falls_back_to_find_and_pin_secondary_when_kv_provided():
     # When the in-memory _records cache is empty and a kv handle is
     # configured, resolve_and_lease should discover blocks via

@@ -4863,6 +4863,8 @@ TEST_F(KVCacheManagerTest, FindAndPinSecondaryBlockByHashSkipsPrimaryReturnsSeco
         auto result = kvCacheManager.findAndPinSecondaryBlockByHash(block->getHash(), maxAttentionWindow);
         EXPECT_FALSE(result.has_value())
             << "primary-only block " << bid << " must NOT be returned by secondary-only lookup";
+        EXPECT_TRUE(kvCacheManager.hasPrimaryBlockByHash(block->getHash(), maxAttentionWindow))
+            << "primary-only block " << bid << " should be classified as primary";
     }
 
     // Force the stored blocks to migrate to secondary by allocating more primary
@@ -4909,10 +4911,12 @@ TEST_F(KVCacheManagerTest, FindAndPinSecondaryBlockByHashSkipsPrimaryReturnsSeco
     // Unknown hash returns nullopt.
     auto missing = kvCacheManager.findAndPinSecondaryBlockByHash(0xdeadbeefdeadbeefULL, maxAttentionWindow);
     EXPECT_FALSE(missing.has_value());
+    EXPECT_FALSE(kvCacheManager.hasPrimaryBlockByHash(0xdeadbeefdeadbeefULL, maxAttentionWindow));
 
     // Unknown window returns nullopt (empty optional, not a crash).
     auto wrongWindow = kvCacheManager.findAndPinSecondaryBlockByHash(0, maxAttentionWindow + 1);
     EXPECT_FALSE(wrongWindow.has_value());
+    EXPECT_FALSE(kvCacheManager.hasPrimaryBlockByHash(0, maxAttentionWindow + 1));
 }
 
 // Regression test for NVBug 6018647: storeBlocks(pin=true) on a zero-ref block

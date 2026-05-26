@@ -1130,6 +1130,13 @@ public:
     [[nodiscard]] std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>>
     findAndPinSecondaryBlockByHash(size_t blockHash);
 
+    //! \brief Returns true if a live primary block in this window currently
+    //! caches the requested hash. This is a classification helper for remote-G2:
+    //! primary blocks are not pinned or returned because the transfer path is
+    //! host-pool-only, but callers need to distinguish a primary hit from a
+    //! genuinely missing block.
+    [[nodiscard]] bool hasPrimaryBlockByHash(size_t blockHash);
+
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
@@ -1686,6 +1693,16 @@ public:
         return it->second.findAndPinSecondaryBlockByHash(blockHash);
     }
 
+    [[nodiscard]] bool hasPrimaryBlockByHash(size_t blockHash, SizeType32 windowSize)
+    {
+        auto it = mWindowBlockManagers.find(windowSize);
+        if (it == mWindowBlockManagers.end())
+        {
+            return false;
+        }
+        return it->second.hasPrimaryBlockByHash(blockHash);
+    }
+
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumPrimaryBlocks(); });
@@ -2054,6 +2071,8 @@ public:
     [[nodiscard]] virtual std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>>
     findAndPinSecondaryBlockByHash(size_t blockHash, SizeType32 windowSize)
         = 0;
+
+    [[nodiscard]] virtual bool hasPrimaryBlockByHash(size_t blockHash, SizeType32 windowSize) = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
 
@@ -2439,6 +2458,11 @@ public:
         size_t blockHash, SizeType32 windowSize) override
     {
         return mBlockManager.findAndPinSecondaryBlockByHash(blockHash, windowSize);
+    }
+
+    bool hasPrimaryBlockByHash(size_t blockHash, SizeType32 windowSize) override
+    {
+        return mBlockManager.hasPrimaryBlockByHash(blockHash, windowSize);
     }
 
     void resetReuseState() override

@@ -69,7 +69,7 @@ std::optional<tensorrt_llm::runtime::ITensor::UniquePtr> from_torch(std::optiona
 class PyKvCacheManager : public tbk::BaseKVCacheManager
 {
 public:
-    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 39);
+    NB_TRAMPOLINE(tbk::BaseKVCacheManager, 40);
 
     // using BaseKVCacheManager::BaseKVCacheManager; // Inherit constructors
     void allocatePools(bool useUvm = false) override
@@ -613,6 +613,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("pin_blocks_by_id", &BaseKVCacheManager::pinBlocksById, nb::call_guard<nb::gil_scoped_release>())
         .def("find_and_pin_secondary_block_by_hash", &BaseKVCacheManager::findAndPinSecondaryBlockByHash,
             nb::arg("block_hash"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
+        .def("has_primary_block_by_hash", &BaseKVCacheManager::hasPrimaryBlockByHash, nb::arg("block_hash"),
+            nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
         .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, nb::call_guard<nb::gil_scoped_release>())
         .def("get_priority_by_block_id", &BaseKVCacheManager::getPriorityByBlockId, nb::arg("block_id"),
             nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>());

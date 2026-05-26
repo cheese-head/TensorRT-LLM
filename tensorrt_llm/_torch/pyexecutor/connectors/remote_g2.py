@@ -324,6 +324,12 @@ class RemoteG2BlockStatus:
     descriptor_generation: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class RemoteG2KvLookupResult:
+    status: str
+    record: Optional[SourceG2DescriptorRecord] = None
+
+
 @dataclass
 class RemoteG2Lease:
     lease_id: str
@@ -908,7 +914,15 @@ class SourceG2DescriptorRegistry:
                 kv_hash = int(kv_hashes[i])
                 record = self._records.get(kv_hash)
                 if record is None and self._kv is not None:
-                    record = self._lookup_via_find_block_by_hash(kv_hash)
+                    lookup = self._lookup_via_find_block_by_hash(kv_hash)
+                    if lookup.status == "promoted_primary":
+                        per_block_status.append(
+                            RemoteG2BlockStatus(
+                                int(identity_hash), "promoted_primary"
+                            )
+                        )
+                        break
+                    record = lookup.record
                 if record is None:
                     per_block_status.append(RemoteG2BlockStatus(int(identity_hash), "missing"))
                     break
@@ -1033,7 +1047,7 @@ class SourceG2DescriptorRegistry:
 
     def _lookup_via_find_block_by_hash(
         self, block_hash: int
-    ) -> Optional[SourceG2DescriptorRecord]:
+    ) -> RemoteG2KvLookupResult:
         """Resolve a block by hash through the C++ KV cache manager via the
         atomic find_and_pin_secondary_block_by_hash API. The returned record
         is anchored to the POST-PIN slot, and the underlying C++ call has
@@ -1041,20 +1055,28 @@ class SourceG2DescriptorRegistry:
         commit. The downstream acquire_pin path must only register the pin
         with the lease (NOT pin again), and the lease release must unpin it.
 
-        Returns None if no live secondary block in this window currently
-        caches the requested hash. Returning None correctly steers the caller
-        away from remote-G2 reuse (target falls back to local prefill).
+        If the secondary lookup misses, a primary-only classifier distinguishes
+        a live primary hit from a genuinely missing block. Primary hits are
+        reported as promoted_primary so the target rejects the remote-G2 plan
+        and falls back instead of attempting host-pool transfer from VRAM.
         """
         if self._window_size is None or self._block_size_bytes <= 0:
-            return None
+            return RemoteG2KvLookupResult("missing")
         try:
             loc = self._kv.find_and_pin_secondary_block_by_hash(
                 block_hash, int(self._window_size)
             )
         except Exception:
-            return None
+            return RemoteG2KvLookupResult("missing")
         if loc is None:
-            return None
+            has_primary = getattr(self._kv, "has_primary_block_by_hash", None)
+            if callable(has_primary):
+                try:
+                    if has_primary(block_hash, int(self._window_size)):
+                        return RemoteG2KvLookupResult("promoted_primary")
+                except Exception:
+                    pass
+            return RemoteG2KvLookupResult("missing")
         block_id, slot_idx = loc
         byte_offset = int(slot_idx) * self._block_size_bytes
         record = SourceG2DescriptorRecord(
@@ -1080,4 +1102,4 @@ class SourceG2DescriptorRegistry:
         # — it should only register this pin with the lease so release_lease
         # can unpin once the transfer completes.
         record._pinned_by_lookup = True
-        return record
+        return RemoteG2KvLookupResult("live", record)

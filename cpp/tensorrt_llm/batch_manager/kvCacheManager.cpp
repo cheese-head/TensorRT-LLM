@@ -2093,6 +2093,31 @@ std::optional<std::tuple<KVCacheBlock::IdType, SizeType32>> WindowBlockManager::
     return std::nullopt;
 }
 
+bool WindowBlockManager::hasPrimaryBlockByHash(size_t blockHash)
+{
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+    for (auto const& block : mAllBlocksById)
+    {
+        if (block == nullptr || block->isPlaceholder())
+        {
+            continue;
+        }
+        if (block->getBlockId() == KVCacheBlock::kCachedBlocksRootId)
+        {
+            continue;
+        }
+        if (block->getLookupNode() == nullptr)
+        {
+            continue;
+        }
+        if (block->getHash() == blockHash && block->isPrimary())
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::shared_ptr<KVCacheBlock> WindowBlockManager::searchReuseTree(std::vector<BlockKey> const& blockKeys)
 {
     if (blockKeys.empty())
