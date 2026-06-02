@@ -730,6 +730,25 @@ def maybe_start_remote_g2_service(
       - Non-rank-0 ranks participate in MPI gather during resolve (S3)
         but do NOT run a ZMQ server.
     """
+    # Auto-detect tp_rank/tp_size from MPI when not passed explicitly.
+    # This handles deployments where py_executor.py doesn't pass the
+    # TP info (e.g. patched connectors without patched py_executor).
+    if tp_rank == 0 and tp_size == 1:
+        try:
+            from tensorrt_llm._utils import mpi_rank, mpi_world_size
+            detected_rank = mpi_rank()
+            detected_size = mpi_world_size()
+            if detected_size > 1:
+                tp_rank = detected_rank
+                tp_size = detected_size
+                logging.warning(
+                    "remote_g2: auto-detected TP from MPI: "
+                    "tp_rank=%d tp_size=%d",
+                    tp_rank, tp_size,
+                )
+        except Exception:
+            pass
+
     identity = _resolve_source_identity()
     if identity is None:
         logging.info(
