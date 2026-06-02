@@ -350,14 +350,18 @@ def _walk_to_dynamo_worker_pid(max_depth: int = 10) -> Optional[int]:
                 if line.startswith("PPid:"):
                     ppid = int(line.split()[1])
                     break
-            if ppid is None or ppid <= 1:
+            if ppid is None or ppid < 1:
                 return None
             try:
                 with open(f"/proc/{ppid}/cmdline") as f:
                     cmdline = f.read().replace("\0", " ")
             except (FileNotFoundError, PermissionError):
                 cmdline = ""
-            if "dynamo.trtllm" in cmdline:
+            if "dynamo.trtllm" in cmdline or "dynamo/trtllm" in cmdline:
+                logging.warning(
+                    "PROBE _walk_to_dynamo_worker_pid: found dynamo parent "
+                    "ppid=%d from pid=%d", ppid, pid,
+                )
                 return ppid
             pid = ppid
         return None
