@@ -659,7 +659,11 @@ class PyExecutor:
                 from .connectors.remote_g2_source_setup import (
                     maybe_start_remote_g2_service,
                 )
-                maybe_start_remote_g2_service(self.kv_cache_manager)
+                maybe_start_remote_g2_service(
+                    self.kv_cache_manager,
+                    tp_rank=self.dist.tp_rank,
+                    tp_size=self.dist.tp_size,
+                )
             except Exception:
                 import logging
                 logging.exception(
@@ -669,7 +673,11 @@ class PyExecutor:
                 from .connectors.remote_g2_target_setup import (
                     maybe_start_remote_g2_target_client,
                 )
-                maybe_start_remote_g2_target_client(self.kv_cache_manager)
+                maybe_start_remote_g2_target_client(
+                    self.kv_cache_manager,
+                    tp_rank=self.dist.tp_rank,
+                    tp_size=self.dist.tp_size,
+                )
             except Exception:
                 import logging
                 logging.exception(
