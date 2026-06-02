@@ -112,6 +112,24 @@ def _result_from_dict(data: dict) -> Optional[RemoteG2ResolveResult]:
             )
             for s in (data.get("per_block_status") or ())
         )
+        # T1/T2: Extract per-rank data if present (TP>1).
+        per_rank_descriptors: dict = {}
+        per_rank_source_metadata: dict = {}
+        raw_prd = data.get("per_rank_descriptors")
+        if isinstance(raw_prd, dict):
+            for rank_key, desc_list in raw_prd.items():
+                rank = int(rank_key)
+                per_rank_descriptors[rank] = desc_list  # raw dicts
+        raw_prm = data.get("per_rank_source_metadata")
+        if isinstance(raw_prm, (dict, list)):
+            if isinstance(raw_prm, list):
+                # List indexed by rank.
+                for i, meta in enumerate(raw_prm):
+                    per_rank_source_metadata[i] = meta
+            else:
+                for rank_key, meta in raw_prm.items():
+                    per_rank_source_metadata[int(rank_key)] = meta
+
         return RemoteG2ResolveResult(
             lease_id=data.get("lease_id"),
             descriptors=descriptors,
@@ -119,6 +137,8 @@ def _result_from_dict(data: dict) -> Optional[RemoteG2ResolveResult]:
             reason=str(data.get("reason", "ok")),
             source_generation=int(data.get("source_generation", 0)),
             per_block_status=per_block_status,
+            per_rank_descriptors=per_rank_descriptors,
+            per_rank_source_metadata=per_rank_source_metadata,
         )
     except (KeyError, TypeError, ValueError):
         logging.exception("remote_g2: malformed resolve response dict: %r", data)
@@ -260,12 +280,13 @@ def _make_source_metadata_fetcher(wrapper: _TargetReqWrapper, peer_info_provider
             remote_name=str(inner["remote_name"]),
             agent_desc=agent_desc,
         )
-        # Stash the connection_info on the dataclass instance for our
-        # subclassed adapter to pick up. The official dataclass is frozen,
-        # but Python lets us attach attrs via object.__setattr__ since
-        # we own the consumer side. Cleaner than threading an extra
-        # arg through the existing source_metadata_fetcher signature.
+        # Stash extra fields on the dataclass instance for downstream use.
         object.__setattr__(meta, "connection_info", connection_info)
+        # T4: Stash per-rank metadata (S5 response) so the adapter can
+        # index by mpi_rank() at transfer time.
+        per_rank_metadata = inner.get("per_rank_metadata")
+        if per_rank_metadata is not None:
+            object.__setattr__(meta, "per_rank_metadata", per_rank_metadata)
         return meta
 
     return _fetch
@@ -713,11 +734,19 @@ def _wait_for_socket(path: str, timeout_s: float = 30.0) -> bool:
     return False
 
 
-def maybe_start_remote_g2_target_client(kv: Optional[Any] = None) -> bool:
+def maybe_start_remote_g2_target_client(
+    kv: Optional[Any] = None,
+    *,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+) -> bool:
     """Open the engine→parent ZMQ REQ socket and install module-state
     callables on remote_g2_connector. Returns True on success, False
     when not configured (no dynamo parent reachable) or when the
     parent's REP socket never appears.
+
+    TP>1: tp_rank and tp_size are passed through so the target adapter
+    knows which rank's source metadata to use for NIXL peer loads.
 
     When ``kv`` (the C++ kv_cache_manager) is provided, also constructs
     the NIXL transfer adapter and installs it + no-op mark_local_valid /

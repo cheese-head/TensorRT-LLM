@@ -329,14 +329,34 @@ class RawNixlRemoteG2Adapter:
             raise RuntimeError("remote G2 record has zero-sized blocks")
         self._block_size_bytes = block_size
 
+        # T3: Determine which source rank's metadata to use.
+        # With TP>1, each target rank loads its corresponding source
+        # rank's NIXL agent and uses that rank's descriptors.
+        from tensorrt_llm._utils import mpi_rank as _mpi_rank
+        my_rank = _mpi_rank()
+
+        resolve_result = record.resolve_result
+        per_rank_meta = getattr(resolve_result, "per_rank_source_metadata", {})
+        per_rank_descs = getattr(resolve_result, "per_rank_descriptors", {})
+
         # Source metadata — drives add_remote_agent + remote dlist.
         if _nvtx is not None:
             _nvtx.range_push("remote_g2 metadata fetch")
         try:
-            source_meta = self._source_metadata_fetcher(
-                record.plan.source_worker_id,
-                int(record.source_generation),
-            )
+            if per_rank_meta and my_rank in per_rank_meta:
+                # TP>1: use this rank's source metadata directly.
+                source_meta = per_rank_meta[my_rank]
+                logging.info(
+                    "remote_g2: T3 using per-rank metadata for tp_rank=%d "
+                    "(source=%s)",
+                    my_rank, source_meta.get("remote_name"),
+                )
+            else:
+                # TP=1 or fallback: fetch via RPC (rank 0's metadata).
+                source_meta = self._source_metadata_fetcher(
+                    record.plan.source_worker_id,
+                    int(record.source_generation),
+                )
         finally:
             if _nvtx is not None:
                 _nvtx.range_pop()
@@ -354,23 +374,40 @@ class RawNixlRemoteG2Adapter:
         # Build index arrays. Block indices into the local dlist =
         # target_block_id; into the remote dlist = source byte_offset
         # divided by block_size.
+        #
+        # T3: With TP>1, use per_rank_descriptors for this rank's
+        # source offsets. Fall back to bound_blocks' descriptors for
+        # TP=1 (where all descriptors are rank 0's).
         local_indices: list[int] = []
         remote_indices: list[int] = []
-        for block in record.bound_blocks:
-            # Use the primary-pool slot index (resolved at bind time) — NIXL's
-            # local dlist is dense over slots; block_ids are globally-unique
-            # engine identifiers that can exceed the slot count.
-            slot_idx = int(getattr(block, "target_slot_idx", -1))
-            if slot_idx < 0:
-                slot_idx = int(block.target_block_id)  # legacy fallback
-            local_indices.append(slot_idx)
-            src_offset = int(block.source_descriptor.byte_offset)
-            remote_indices.append(src_offset // block_size)
 
-        logging.warning(
-            "PROBE remote_g2_raw_make_prepped request_id=%s blocks=%d "
-            "local_head=%d remote_head=%d",
-            record.request_id, len(local_indices),
+        if per_rank_descs and my_rank in per_rank_descs:
+            # TP>1: this rank's descriptors from the per-rank gather.
+            rank_descs = per_rank_descs[my_rank]
+            for i, block in enumerate(record.bound_blocks):
+                slot_idx = int(getattr(block, "target_slot_idx", -1))
+                if slot_idx < 0:
+                    slot_idx = int(block.target_block_id)
+                local_indices.append(slot_idx)
+                if i < len(rank_descs) and rank_descs[i] is not None:
+                    src_offset = int(rank_descs[i].get("byte_offset", 0))
+                else:
+                    src_offset = int(block.source_descriptor.byte_offset)
+                remote_indices.append(src_offset // block_size)
+        else:
+            # TP=1: use bound_blocks directly.
+            for block in record.bound_blocks:
+                slot_idx = int(getattr(block, "target_slot_idx", -1))
+                if slot_idx < 0:
+                    slot_idx = int(block.target_block_id)
+                local_indices.append(slot_idx)
+                src_offset = int(block.source_descriptor.byte_offset)
+                remote_indices.append(src_offset // block_size)
+
+        logging.info(
+            "remote_g2: make_prepped request_id=%s blocks=%d "
+            "tp_rank=%d local_head=%d remote_head=%d",
+            record.request_id, len(local_indices), my_rank,
             local_indices[0] if local_indices else -1,
             remote_indices[0] if remote_indices else -1,
         )
