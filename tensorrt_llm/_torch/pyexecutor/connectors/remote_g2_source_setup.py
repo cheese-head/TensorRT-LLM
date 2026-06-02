@@ -166,7 +166,11 @@ def _result_to_dict(result: Any) -> dict:
     return out
 
 
-def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int) -> str:
+def _start_zmq_rep_service(
+    registry: SourceG2DescriptorRegistry,
+    dynamo_pid: int,
+    tp_size: int = 1,
+) -> str:
     """Start a ZMQ REP daemon thread bound to a Unix domain socket
     tagged with the dynamo parent's PID. The dynamo parent process
     constructs the matching REQ client using the same path. Returns
@@ -203,7 +207,42 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
                 payload = req.get("payload") or {}
                 if method == "resolve_and_lease":
                     result = registry.resolve_and_lease(payload.get("plan"))
-                    response = {"ok": True, "result": _result_to_dict(result)}
+                    result_dict = _result_to_dict(result)
+
+                    # S2: When TP>1, gather per-rank descriptors from
+                    # all TP siblings and attach per-rank metadata from
+                    # the S1 bundle so the target can issue per-rank
+                    # NIXL READs.
+                    if tp_size > 1 and result.reason == "ok" and result.descriptors:
+                        try:
+                            block_hashes = [
+                                d.block_hash for d in result.descriptors
+                            ]
+                            per_rank_descs = _gather_per_rank_descriptors(
+                                block_hashes, registry, tp_size,
+                            )
+                            result_dict["per_rank_descriptors"] = per_rank_descs
+                            logging.info(
+                                "remote_g2: S2 gathered per-rank descriptors "
+                                "for %d ranks, %d blocks each",
+                                len(per_rank_descs),
+                                len(block_hashes),
+                            )
+                        except Exception:
+                            logging.exception(
+                                "remote_g2: S2 per-rank descriptor gather "
+                                "failed; falling back to rank-0 only"
+                            )
+
+                        # Attach per-rank source metadata from S1.
+                        per_rank_bundles = get_per_rank_nixl_bundles()
+                        if per_rank_bundles:
+                            result_dict["per_rank_source_metadata"] = {
+                                entry["tp_rank"]: entry
+                                for entry in per_rank_bundles
+                            }
+
+                    response = {"ok": True, "result": result_dict}
                 elif method == "release_lease":
                     completed = registry.release_lease(
                         payload["lease_id"], payload.get("reason", "ack")
@@ -770,7 +809,7 @@ def maybe_start_remote_g2_service(
     # a ZMQ endpoint since the dynamo parent only talks to rank 0.
     if tp_rank == 0:
         try:
-            socket_path = _start_zmq_rep_service(registry, dynamo_pid)
+            socket_path = _start_zmq_rep_service(registry, dynamo_pid, tp_size=tp_size)
             logging.warning(
                 "remote_g2: ZMQ REP service bound at %s (source_worker_id=%s)",
                 socket_path,
