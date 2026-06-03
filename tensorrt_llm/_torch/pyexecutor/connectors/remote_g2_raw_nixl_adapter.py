@@ -52,8 +52,12 @@ def build_raw_nixl_source_agent(
     try:
         config = nixl_agent_config(
             enable_prog_thread=True,
-            enable_listen_thread=True,
-            listen_port=0,  # OS-assigned
+            # Disable the listen thread to avoid metadata stream port
+            # conflicts when multiple NIXL agents coexist in the same
+            # pod (TP>1 or dynamo's own NIXL agent). We exchange agent
+            # metadata explicitly via add_remote_agent, not via NIXL's
+            # auto-discovery metadata stream.
+            enable_listen_thread=False,
             backends=["UCX"],
         )
         agent = nixl_agent(agent_name, config, instantiate_all=False)
@@ -163,8 +167,7 @@ class RawNixlRemoteG2Adapter:
 
         config = nixl_agent_config(
             enable_prog_thread=True,
-            enable_listen_thread=True,
-            listen_port=0,
+            enable_listen_thread=False,
             backends=["UCX"],
         )
         self._agent = nixl_agent(agent_name, config, instantiate_all=False)
