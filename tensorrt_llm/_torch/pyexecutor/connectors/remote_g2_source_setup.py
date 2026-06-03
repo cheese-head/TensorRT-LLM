@@ -209,31 +209,13 @@ def _start_zmq_rep_service(
                     result = registry.resolve_and_lease(payload.get("plan"))
                     result_dict = _result_to_dict(result)
 
-                    # S2: When TP>1, gather per-rank descriptors from
-                    # all TP siblings and attach per-rank metadata from
-                    # the S1 bundle so the target can issue per-rank
-                    # NIXL READs.
+                    # S2: Per-rank descriptor gather is disabled (S3
+                    # background loop conflicts with framework MPI).
+                    # Each rank resolves independently — rank 0's
+                    # descriptors are in the flat response. Per-rank
+                    # source metadata from S1 is still attached so the
+                    # target can load each source rank's NIXL agent.
                     if tp_size > 1 and result.reason == "ok" and result.descriptors:
-                        try:
-                            block_hashes = [
-                                d.block_hash for d in result.descriptors
-                            ]
-                            per_rank_descs = _gather_per_rank_descriptors(
-                                block_hashes, registry, tp_size,
-                            )
-                            result_dict["per_rank_descriptors"] = per_rank_descs
-                            logging.info(
-                                "remote_g2: S2 gathered per-rank descriptors "
-                                "for %d ranks, %d blocks each",
-                                len(per_rank_descs),
-                                len(block_hashes),
-                            )
-                        except Exception:
-                            logging.exception(
-                                "remote_g2: S2 per-rank descriptor gather "
-                                "failed; falling back to rank-0 only"
-                            )
-
                         # Attach per-rank source metadata from S1.
                         per_rank_bundles = get_per_rank_nixl_bundles()
                         if per_rank_bundles:
@@ -897,16 +879,18 @@ def maybe_start_remote_g2_service(
                 "resolve will still work, but transfer is disabled"
             )
 
-    # S3 — non-rank-0 TP siblings enter a blocking resolve-participation
-    # loop. They wait for rank 0 to broadcast block hashes during resolve
-    # RPCs, do local findAndPinSecondaryBlockByHash, and gather results
-    # back. This loop runs until the process exits.
+    # S3 — disabled: the background-thread approach conflicts with the
+    # framework's MPI broadcasts (_run_on_leader). MPI calls are not
+    # tagged, so a background mpi_broadcast intercepts framework
+    # broadcasts meant for the main thread. The per-rank resolve gather
+    # (S2) needs to be integrated into the framework's _run_on_leader
+    # path instead of using a separate thread. For now, each rank
+    # resolves independently using its own registry (TP=1-style), and
+    # the per-rank metadata from S1/S5 enables per-rank NIXL transfers.
     if tp_rank != 0 and tp_size > 1:
-        _start_sibling_rank_resolve_loop(
-            kv=kv,
-            registry=registry,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+        logging.info(
+            "remote_g2: S3 sibling loop disabled (MPI conflict with "
+            "framework broadcasts); per-rank resolve via S1/S5 metadata"
         )
 
     return registry
