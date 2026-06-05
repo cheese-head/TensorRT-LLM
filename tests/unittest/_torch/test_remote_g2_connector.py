@@ -165,19 +165,31 @@ def _resolve_result(block_hashes=(11, 22, 33), num_tokens=48, lease_id="lease-1"
 
 
 class _FakeTransferResult:
-    def __init__(self, record, completed=True, fail=False):
+    def __init__(self, record, completed=True, fail=False, failed=False):
         self.record = record
         self.completed = completed
+        # fail=True raises from is_completed() (poll-time exception path).
         self.fail = fail
+        # failed=True reports an explicit NIXL failed state (silent failure
+        # path that the connector must detect without waiting for timeout).
+        self.failed = failed
         self.released = 0
+        self.aborted = 0
 
     def is_completed(self):
         if self.fail:
             raise RuntimeError("transfer failed")
         return self.completed
 
+    def is_failed(self):
+        return self.failed
+
     def release(self):
         self.released += 1
+
+    def abort(self):
+        self.aborted += 1
+        self.release()
 
 
 class _FakeTransferAdapter:
@@ -379,6 +391,9 @@ def test_remote_g2_worker_reports_finished_only_after_transfer_success():
 
 
 def test_remote_g2_worker_failure_releases_once_and_publishes_nothing():
+    # A poll-time exception must NOT propagate into the executor loop: the
+    # connector records the failed block ids, releases the handle + lease
+    # once, publishes nothing, and reports finished_loading as empty.
     released = []
     published = []
     result = None
@@ -400,8 +415,8 @@ def test_remote_g2_worker_failure_releases_once_and_publishes_nothing():
     worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
     worker.start_load_kv(None)
 
-    with pytest.raises(RuntimeError, match="failed closed"):
-        worker.get_finished([], [1234])
+    assert worker.get_finished([], [1234]) == ([], [])
+    assert worker.get_block_ids_with_load_errors() == [101, 102]
     assert worker.get_finished([], [1234]) == ([], [])
     assert result.released == 1
     assert released == [("lease-bound", "transfer_failed")]
@@ -409,6 +424,8 @@ def test_remote_g2_worker_failure_releases_once_and_publishes_nothing():
 
 
 def test_remote_g2_worker_timeout_releases_transfer_and_lease_once():
+    # A timeout falls back to local recompute: report the blocks, release
+    # once, and never raise.
     released = []
     result = None
 
@@ -429,8 +446,8 @@ def test_remote_g2_worker_timeout_releases_transfer_and_lease_once():
     worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
     worker.start_load_kv(None)
 
-    with pytest.raises(RuntimeError, match="timed out"):
-        worker.get_finished([], [1234])
+    assert worker.get_finished([], [1234]) == ([], [])
+    assert worker.get_block_ids_with_load_errors() == [101, 102]
     assert worker.get_finished([], [1234]) == ([], [])
     assert result.released == 1
     assert released == [("lease-bound", "transfer_timeout")]
@@ -486,8 +503,7 @@ def test_remote_g2_worker_emits_fallback_before_validity_or_publication():
     worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
     worker.start_load_kv(None)
 
-    with pytest.raises(RuntimeError, match="failed closed"):
-        worker.get_finished([], [1234])
+    assert worker.get_finished([], [1234]) == ([], [])
     fallback = [event for event in sink.events if event.event == "fallback"]
     assert fallback
     assert fallback[0].outcome == "local_recompute"
@@ -509,11 +525,13 @@ def test_remote_g2_worker_emits_failed_after_validity_is_marked():
     worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
     worker.start_load_kv(None)
 
-    with pytest.raises(RuntimeError, match="failed closed"):
-        worker.get_finished([], [1234])
+    # Publication failure after validity is marked is fail-closed: it must
+    # not raise, and the failed blocks are surfaced for recompute.
+    assert worker.get_finished([], [1234]) == ([], [])
     failed = [event for event in sink.events if event.event == "failed"]
     assert failed
     assert failed[0].outcome == "fail_closed"
+    assert worker.get_block_ids_with_load_errors() == [101, 102]
 
 
 def test_remote_g2_worker_observability_never_logs_raw_descriptors():
@@ -536,16 +554,221 @@ def test_remote_g2_worker_observability_never_logs_raw_descriptors():
         assert not any(value in detail_text for value in forbidden)
 
 
-# Remote-G2 depends on retryable KV admission in KVCM V1, which is not validated
-# with the overlap scheduler because local offload/onboard can interleave with forward.
-def test_remote_g2_requires_overlap_scheduler_disabled():
+# Remote-G2 depends on retryable KV admission in KVCM V1. PR #6 keeps overlap
+# enabled, but rejects attention-DP and non-uniform/linear attention windows for
+# now because those configurations are not validated with retryable admission.
+def test_remote_g2_connector_declares_pr6_capability_gates():
     scheduler_cls = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorScheduler
     worker_cls = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker
 
-    assert scheduler_cls.requires_disable_overlap_scheduler
-    assert worker_cls.requires_disable_overlap_scheduler
+    assert scheduler_cls.requires_retryable_kv_admission
+    assert worker_cls.requires_retryable_kv_admission
+    assert not scheduler_cls.requires_disable_overlap_scheduler
+    assert not worker_cls.requires_disable_overlap_scheduler
+    assert scheduler_cls.requires_disable_attention_dp
+    assert worker_cls.requires_disable_attention_dp
+    assert scheduler_cls.requires_uniform_attention_window
+    assert worker_cls.requires_uniform_attention_window
 
 
+# Group E — structured failure reporting (no propagation, report block ids,
+# drain once per step).
+
+
+def test_remote_g2_worker_failed_state_does_not_propagate_and_reports_blocks():
+    # An explicit NIXL failed state (is_completed() returns False, is_failed()
+    # returns True) is detected immediately, without waiting for the timeout,
+    # and surfaced as failed block ids rather than raising.
+    released = []
+    result = None
+
+    def make_result(record):
+        nonlocal result
+        result = _FakeTransferResult(record, completed=False, failed=True)
+        return result
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
+        or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+        # Large timeout so the failure is attributable to is_failed(), not time.
+        transfer_timeout_ms=10**9,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    assert worker.get_finished([], [1234]) == ([], [])
+    assert worker.get_block_ids_with_load_errors() == [101, 102]
+    assert result.released == 1
+    assert released == [("lease-bound", "transfer_failed")]
+
+
+def test_remote_g2_worker_failed_block_ids_drained_once_per_step():
+    # Reporting clears the internal list so the same failure is surfaced
+    # exactly once.
+    def make_result(record):
+        return _FakeTransferResult(record, completed=False, failed=True)
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+        transfer_timeout_ms=10**9,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    worker.get_finished([], [1234])
+    assert worker.get_block_ids_with_load_errors() == [101, 102]
+    # Second drain is empty: the failure was reported once.
+    assert worker.get_block_ids_with_load_errors() == []
+
+
+# Group F — initiator-side abort.
+
+
+def _abort_worker(released):
+    result_holder = {}
+
+    def make_result(record):
+        result = _FakeTransferResult(record, completed=False)
+        result_holder["result"] = result
+        return result
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
+        or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+    return worker, result_holder
+
+
+def test_abort_request_calls_result_abort():
+    worker, result_holder = _abort_worker([])
+    worker.abort_request(1234)
+    assert result_holder["result"].aborted == 1
+
+
+def test_abort_request_releases_lease_once():
+    released = []
+    worker, _ = _abort_worker(released)
+    worker.abort_request(1234)
+    worker.abort_request(1234)
+    assert released == [("lease-bound", "cancelled")]
+
+
+def test_abort_request_releases_transfer_handle_once():
+    worker, result_holder = _abort_worker([])
+    worker.abort_request(1234)
+    # abort() delegates to release() exactly once.
+    assert result_holder["result"].released == 1
+
+
+def test_abort_request_after_completion_is_noop():
+    def make_result(record):
+        return _FakeTransferResult(record, completed=True)
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+    # Completes and is moved out of _active_loads.
+    assert worker.get_finished([], [1234]) == ([], [1234])
+    # Aborting a completed (no longer active) request is a no-op.
+    worker.abort_request(1234)
+
+
+def test_abort_request_unknown_id_is_noop():
+    worker, _ = _abort_worker([])
+    worker.abort_request(999999)  # never started; must not raise
+
+
+# Recompute-fallback: a failed load rewinds the request's computed prefix back
+# to the local (on-device) prefix and re-admits it to CONTEXT_INIT for local
+# recompute instead of terminating it. Exercises the real manager method.
+#
+# Exercises the *real* KvCacheConnectorManager.recompute_failed_load in a fresh
+# subprocess. This module stubs tensorrt_llm in sys.modules so the rest of the
+# suite runs binding-free, and the real package is a nanobind/MPI C-extension
+# that cannot be re-imported into this (already-stubbed, torch-loaded) process
+# without aborting. A clean interpreter sidesteps both problems and still runs
+# production code. Skips when the bindings are unavailable (bare environment).
+_RECOMPUTE_SUBPROCESS = """
+from types import SimpleNamespace
+from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
+    KvCacheConnectorManager,
+)
+from tensorrt_llm.bindings import LlmRequestState
+
+
+class _Req:
+    def __init__(self):
+        self.request_id = 1234
+        self.prepopulated_prompt_len = 48  # local(16) + external(32)
+        self.py_num_connector_matched_tokens = 32
+        self.state = None
+        self.context_current_position = 48
+
+    def set_prepopulated_prompt_len(self, n, tokens_per_block):
+        self.prepopulated_prompt_len = n
+
+
+fake_self = SimpleNamespace(
+    new_async_requests=SimpleNamespace(loading={1234: object()}),
+    pending_async_requests=SimpleNamespace(loading={1234: object()}),
+    local_finished_async_requests=SimpleNamespace(loading={}),
+    finished_async_loading_requests={},
+    worker=SimpleNamespace(),
+)
+req = _Req()
+ok = KvCacheConnectorManager.recompute_failed_load(fake_self, req, tokens_per_block=16)
+assert ok is True
+assert req.state == LlmRequestState.CONTEXT_INIT
+assert req.context_current_position == 16
+assert req.prepopulated_prompt_len == 16
+assert req.py_num_connector_matched_tokens == 0
+assert 1234 in fake_self.finished_async_loading_requests
+assert 1234 not in fake_self.pending_async_requests.loading
+assert 1234 not in fake_self.new_async_requests.loading
+print("RECOMPUTE_OK")
+"""
+
+
+def test_recompute_failed_load_rewinds_to_local_prefix():
+    import subprocess
+
+    proc = subprocess.run(
+        [sys.executable, "-c", _RECOMPUTE_SUBPROCESS],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if "RECOMPUTE_OK" in proc.stdout:
+        return
+    if any(
+        marker in proc.stderr
+        for marker in ("ModuleNotFoundError", "ImportError", "No module named")
+    ):
+        pytest.skip("tensorrt_llm bindings unavailable in this environment")
+    pytest.fail(
+        "recompute_failed_load subprocess did not pass:\n"
+        f"returncode={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}"
+    )
 # Startup check: kv_cache_config.enable_partial_reuse must be False when the
 # remote-G2 connector is constructed. Partial reuse silently stops remote-G2
 # fetch from triggering, so misconfiguration must fail fast.

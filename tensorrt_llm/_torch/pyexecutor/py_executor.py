@@ -2168,6 +2168,38 @@ class PyExecutor:
             self.kv_connector_manager.worker.wait_for_save(
                 torch.cuda.current_stream())
 
+    def _kv_connector_handle_load_errors(self):
+        """Handle KV cache external-load failures reported by the connector.
+
+        Requests whose external load failed fall back to local recompute:
+        their computed prefix is rewound to the local (on-device) prefix so
+        the engine recomputes the tokens the load was meant to fill. Requests
+        for which the rewind cannot be applied are terminated with an error.
+        """
+        if self.kv_connector_manager is None:
+            return
+        affected = self.kv_connector_manager.handle_load_errors(
+            self.active_requests, self.kv_cache_manager)
+        if not affected:
+            return
+        tokens_per_block = self.kv_cache_manager.tokens_per_block
+        to_terminate = []
+        for req in affected:
+            if self.kv_connector_manager.recompute_failed_load(
+                    req, tokens_per_block):
+                logger.warning(
+                    f"KV cache load failed for request {req.py_request_id}; "
+                    "falling back to local recompute.")
+            else:
+                to_terminate.append(req)
+        if to_terminate:
+            for req in to_terminate:
+                logger.error(
+                    f"KV cache load failure for request {req.py_request_id}, "
+                    "terminating with error.")
+            self._handle_errors("KV cache load failure",
+                                 requests=to_terminate)
+
     def _is_benchmark_disagg_fill_complete(
             self, scheduled_batch: ScheduledRequests) -> bool:
         """Check whether all benchmark disagg requests have completed KV transfer.
@@ -3638,6 +3670,7 @@ class PyExecutor:
             torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
+            self._kv_connector_handle_load_errors()
 
             return outputs
         except Exception as e:
@@ -3948,6 +3981,11 @@ class PyExecutor:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id not in canceled_req_ids_set:
                 continue
+
+            # Tear down any in-flight connector load so a cancelled request
+            # does not leak its NIXL transfer or stay tracked as loading.
+            if self.kv_connector_manager is not None:
+                self.kv_connector_manager.abort_request(request.request_id)
 
             is_cancelled = self._try_cancel_request(request)
             if is_cancelled:

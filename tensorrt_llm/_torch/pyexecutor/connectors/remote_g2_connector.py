@@ -295,6 +295,10 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         self._active_loads: dict[int | str, _RemoteG2ActiveLoad] = {}
         self._completed_loads: set[int | str] = set()
         self._released_leases: set[str] = set()
+        # Target-pool block ids of loads that failed since the last drain.
+        # Surfaced to the executor via get_block_ids_with_load_errors() so it
+        # can fall back to local recompute instead of waiting for the timeout.
+        self._failed_block_ids: list[int] = []
 
     @property
     def _transfer_adapter(self) -> Optional[Any]:
@@ -387,56 +391,141 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
             if active is None:
                 continue
             record = active.result.record
-            try:
-                completed = active.result.is_completed()
-            except Exception as exc:
-                self._active_loads.pop(request_id, None)
-                try:
-                    self._release_transfer_result_once(active.result)
-                finally:
-                    self._emit_record_event(
-                        "fallback",
-                        record,
-                        reason="transfer_failed",
-                        outcome="local_recompute",
-                    )
-                    self._release_record_once(record, "transfer_failed")
-                raise RuntimeError("remote G2 transfer failed closed") from exc
 
-            if completed:
-                try:
-                    self._release_transfer_result_once(active.result)
-                    self._emit_record_event(
-                        "transferred",
-                        record,
-                        reason="ok",
-                        outcome="completed",
-                    )
-                    self._complete_success(active)
-                    self._active_loads.pop(request_id, None)
-                    self._completed_loads.add(request_id)
-                    finished_loading.append(int(request_id))
-                except Exception as exc:
-                    self._active_loads.pop(request_id, None)
-                    try:
-                        self._release_transfer_result_once(active.result)
-                    finally:
-                        self._release_record_once(record, "transfer_failed")
-                    raise RuntimeError("remote G2 transfer failed closed") from exc
-            elif _now_ms() - active.started_at_ms > self._transfer_timeout_ms:
+            # Poll for completion. A raised exception, an explicit NIXL
+            # failed state, or a timeout are all treated as a transfer
+            # failure: we record the affected block ids, release the
+            # handle + lease, and fall back to local recompute. Crucially we
+            # do NOT raise into the executor loop — a single failed transfer
+            # must not take down the engine, and the timeout is no longer the
+            # only way a mid-flight error surfaces.
+            completed = False
+            failure_reason: Optional[str] = None
+            try:
+                completed = bool(active.result.is_completed())
+            except Exception:
+                failure_reason = "transfer_failed"
+            else:
+                if not completed and self._result_failed(active.result):
+                    failure_reason = "transfer_failed"
+
+            if failure_reason is None and not completed:
+                if _now_ms() - active.started_at_ms > self._transfer_timeout_ms:
+                    failure_reason = "transfer_timeout"
+
+            if failure_reason is not None:
+                self._fail_active_load(request_id, active, failure_reason)
+                continue
+
+            if not completed:
+                continue
+
+            # Transfer reported success. Releasing the handle, marking the
+            # blocks locally valid, and publishing the binding can still
+            # fail; _complete_success emits the appropriate event and
+            # releases the record on its own failure paths, so here we just
+            # surface the blocks for recompute and drop the load without
+            # raising.
+            self._release_transfer_result_once(active.result)
+            self._emit_record_event(
+                "transferred",
+                record,
+                reason="ok",
+                outcome="completed",
+            )
+            try:
+                self._complete_success(active)
+            except Exception:
                 self._active_loads.pop(request_id, None)
-                try:
-                    self._release_transfer_result_once(active.result)
-                finally:
-                    self._emit_record_event(
-                        "fallback",
-                        record,
-                        reason="transfer_timeout",
-                        outcome="local_recompute",
-                    )
-                    self._release_record_once(record, "transfer_timeout")
-                raise RuntimeError("remote G2 transfer timed out")
+                self._record_failed_blocks(record)
+                continue
+            self._active_loads.pop(request_id, None)
+            self._completed_loads.add(request_id)
+            finished_loading.append(int(request_id))
         return ([], finished_loading)
+
+    def get_block_ids_with_load_errors(self) -> list[int]:
+        """Return target-pool block ids whose remote-G2 load failed since the
+        last call, then clear the internal list (drain-once-per-step).
+
+        The executor unions these across ranks and falls back to local
+        recompute for the affected requests. Reporting and clearing in one
+        call guarantees a given failure is surfaced exactly once.
+        """
+        failed = self._failed_block_ids
+        self._failed_block_ids = []
+        return failed
+
+    def abort_request(self, request_id: int | str) -> None:
+        """Tear down an in-flight load for a cancelled/preempted request.
+
+        Cancels the NIXL transfer (via the result's abort hook) and releases
+        the lease exactly once. No-op for unknown ids or loads that already
+        completed (and were moved out of _active_loads).
+        """
+        active = self._active_loads.pop(request_id, None)
+        if active is None:
+            return
+        result = active.result
+        abort = getattr(result, "abort", None)
+        if abort is not None:
+            try:
+                abort()
+            except Exception:
+                import logging as _logging
+                _logging.exception("remote_g2: transfer abort failed")
+        else:
+            self._release_transfer_result_once(result)
+        record = result.record
+        self._emit_record_event(
+            "fallback",
+            record,
+            reason="cancelled",
+            outcome="aborted",
+        )
+        self._release_record_once(record, "cancelled")
+
+    def _result_failed(self, result: Any) -> bool:
+        """True when the transfer result reports an explicit failed state.
+
+        Results predating the failed-state protocol expose only
+        is_completed(); for them we return False and rely on the timeout.
+        """
+        is_failed = getattr(result, "is_failed", None)
+        if is_failed is None:
+            return False
+        try:
+            return bool(is_failed())
+        except Exception:
+            return True
+
+    def _record_failed_blocks(self, record: RemoteG2BindingRecord) -> None:
+        for block in record.bound_blocks:
+            self._failed_block_ids.append(int(block.target_block_id))
+
+    def _fail_active_load(
+        self,
+        request_id: int | str,
+        active: "_RemoteG2ActiveLoad",
+        reason: str,
+    ) -> None:
+        """Common teardown for a failed in-flight load: drop it, release the
+        NIXL handle, record its blocks for recompute, and release the lease."""
+        self._active_loads.pop(request_id, None)
+        try:
+            self._release_transfer_result_once(active.result)
+        except Exception:
+            import logging as _logging
+            _logging.exception("remote_g2: release after failed transfer raised")
+        record = active.result.record
+        self._record_failed_blocks(record)
+        self._emit_record_event(
+            "fallback",
+            record,
+            reason=reason,
+            outcome="local_recompute",
+        )
+        self._release_record_once(record, reason)
 
     def _complete_success(self, active: "_RemoteG2ActiveLoad") -> None:
         record = active.result.record

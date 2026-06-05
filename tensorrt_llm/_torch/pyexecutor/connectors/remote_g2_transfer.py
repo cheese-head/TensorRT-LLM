@@ -104,6 +104,23 @@ class RemoteG2TransferResult:
     def is_completed(self) -> bool:
         return bool(self.status.is_completed())
 
+    def is_failed(self) -> bool:
+        """True when the underlying transfer status reports a failure.
+
+        The TRT-LLM NIXL wrapper status object may expose an explicit
+        failure check; if it does not, we cannot distinguish failure from
+        in-progress and conservatively return False (the connector's
+        transfer timeout remains the backstop). The raw NIXL adapter
+        (the production path) implements the authoritative check.
+        """
+        checker = getattr(self.status, "is_failed", None)
+        if checker is None:
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return True
+
     def wait(self, timeout_ms: Optional[int] = None) -> bool:
         return bool(self.status.wait(timeout_ms))
 
@@ -112,6 +129,15 @@ class RemoteG2TransferResult:
             return
         self.agent.deregister_memory(self.target_registration)
         self.released = True
+
+    def abort(self) -> None:
+        """Cancel/tear down the transfer for a cancelled request.
+
+        The wrapper path exposes no in-flight cancel primitive beyond
+        deregistering the target memory, so abort() mirrors release() for
+        protocol parity with the raw NIXL adapter.
+        """
+        self.release()
 
 
 class RemoteG2SourceMetadataCache:

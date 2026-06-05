@@ -187,6 +187,34 @@ class KvCacheConnectorWorker(ABC):
         longer than others to complete the operations.
         """
 
+    def get_block_ids_with_load_errors(self) -> List[int]:
+        """
+        Return the IDs of KV cache blocks whose external load failed this step.
+
+        Block IDs must be in the same namespace as
+        ``KVCacheManager.get_cache_indices`` on this rank. Called once per
+        forward pass, after wait_for_save(). Connectors override this to
+        report blocks whose external load failed (network error, timeout,
+        missing cache entry). For async loads, failed blocks must be reported
+        no later than the forward pass in which the affected request id would
+        otherwise be returned by get_finished().
+
+        The runtime unions the reported ids across ranks and either falls back
+        to local recompute or terminates the affected requests. The default
+        implementation returns an empty list (no failures).
+        """
+        return []
+
+    def abort_request(self, request_id: int):
+        """
+        Tear down any in-flight async transfer for a cancelled/preempted
+        request and drop the connector's per-request state for it.
+
+        Called from the executor's cancellation path. The default
+        implementation is a no-op for connectors that have nothing to abort.
+        """
+        return
+
 
 class KvCacheConnectorScheduler(ABC):
     requires_retryable_kv_admission = False
@@ -636,6 +664,91 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def update_state_after_alloc(self, req: LlmRequest, block_ids: List[int]):
         if self.scheduler is not None:
             self.scheduler.update_state_after_alloc(req, block_ids)
+
+    def handle_load_errors(
+        self, active_requests: List[LlmRequest], kv_cache_manager: "KVCacheManager"
+    ) -> List[LlmRequest]:
+        """
+        Find active requests affected by a failed external KV load this step.
+
+        Calls worker.get_block_ids_with_load_errors(), unions the results
+        across all ranks via mpi_allgather (a failure on any rank affects the
+        request), then returns the active requests whose allocated blocks
+        overlap the failed set. The caller decides whether to recompute or
+        terminate those requests.
+        """
+        failed_block_ids = self.worker.get_block_ids_with_load_errors()
+        all_failed = mpi_allgather(failed_block_ids)
+        failed_set = set(
+            block_id for rank_ids in all_failed for block_id in rank_ids
+        )
+        if not failed_set:
+            return []
+
+        affected = []
+        for req in active_requests:
+            try:
+                block_ids = kv_cache_manager.get_cache_indices(req)
+            except Exception:
+                continue
+            if failed_set.intersection(block_ids):
+                affected.append(req)
+        return affected
+
+    def recompute_failed_load(
+        self, req: LlmRequest, tokens_per_block: int
+    ) -> bool:
+        """
+        Fall back to local recompute for a request whose external load failed.
+
+        Rewinds the request's prepopulated/computed prefix back down to the
+        local (on-device radix) prefix so the engine recomputes the tokens the
+        external load was supposed to fill. The already-allocated blocks are
+        kept and overwritten in place; remote-G2 never publishes loaded blocks
+        into the reuse tree, so nothing stale needs invalidating.
+
+        Returns True if the request was successfully re-admitted for local
+        recompute, False if the rewind could not be applied (caller should
+        terminate the request instead).
+        """
+        try:
+            rid = req.request_id
+            matched = int(getattr(req, "py_num_connector_matched_tokens", 0) or 0)
+            local_prefix = max(int(req.prepopulated_prompt_len) - matched, 0)
+
+            # Drop in-flight loading bookkeeping and mark the request as
+            # already-onboarded so it is not re-add_sequence'd (its blocks are
+            # still allocated) when it is rescheduled.
+            self.new_async_requests.loading.pop(rid, None)
+            self.pending_async_requests.loading.pop(rid, None)
+            self.local_finished_async_requests.loading.pop(rid, None)
+            self.finished_async_loading_requests[rid] = req
+
+            # State must be a context-phase state before set_prepopulated_prompt_len
+            # (its internal setContextChunkSize CHECK requires it). Set the
+            # computed position explicitly too so the local_prefix == 0 case
+            # (no local radix match) rewinds fully to the start of the prompt.
+            req.state = LlmRequestState.CONTEXT_INIT
+            req.context_current_position = local_prefix
+            req.set_prepopulated_prompt_len(local_prefix, tokens_per_block)
+            req.py_num_connector_matched_tokens = 0
+            return True
+        except Exception:
+            return False
+
+    def abort_request(self, request_id: int):
+        """
+        Tear down an in-flight async load for a cancelled/preempted request.
+
+        Aborts the worker-side transfer and drops the manager's per-request
+        loading bookkeeping so a cancelled request neither leaks its transfer
+        nor stays tracked as loading.
+        """
+        self.worker.abort_request(request_id)
+        self.new_async_requests.loading.pop(request_id, None)
+        self.pending_async_requests.loading.pop(request_id, None)
+        self.local_finished_async_requests.loading.pop(request_id, None)
+        self.finished_async_loading_requests.pop(request_id, None)
 
     def set_scheduler_output(self, scheduler_output: SchedulerOutput):
         self._scheduler_output = scheduler_output

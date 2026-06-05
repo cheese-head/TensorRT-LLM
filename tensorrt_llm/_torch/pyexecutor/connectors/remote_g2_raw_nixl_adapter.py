@@ -441,6 +441,22 @@ class _RawNixlTransferResult:
             )
         return state_str in ("DONE", "SUCCESS")
 
+    def is_failed(self) -> bool:
+        """True when NIXL reports the transfer as failed/errored.
+
+        check_xfer_state collapses every non-success, non-in-progress
+        nixl_status_t into "ERR", so any state that is neither DONE nor
+        PROC is treated as a hard failure. A raised exception while polling
+        is also a failure (the handle is unusable). This lets the connector
+        distinguish a mid-flight error from "still in progress" instead of
+        waiting for the transfer timeout to fire.
+        """
+        try:
+            state = self.agent.check_xfer_state(self.handle)
+        except Exception:
+            return True
+        return str(state).upper() in ("ERR", "ERROR", "FAILED")
+
     def wait(self, timeout_ms: Optional[int] = None) -> bool:
         import time
         deadline = None if timeout_ms is None else time.monotonic() + timeout_ms / 1000.0
@@ -462,3 +478,14 @@ class _RawNixlTransferResult:
         except Exception:
             logging.exception("remote_g2: release_xfer_handle failed")
         self._released = True
+
+    def abort(self) -> None:
+        """Cancel an in-flight transfer for a cancelled/preempted request.
+
+        Modern NIXL has no separate abort_xfer(); release_xfer_handle()
+        cancels an active transfer before freeing the handle, so abort and
+        release share the same primitive. abort() exists as a distinct,
+        intent-revealing entry point for the cancellation path and is
+        idempotent (no-op once already released/completed).
+        """
+        self.release()
