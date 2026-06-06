@@ -1951,16 +1951,14 @@ WindowBlockManager::ClaimResult WindowBlockManager::buildClaimResultMetadata(
     return result;
 }
 
-std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBatch(
+std::vector<WindowBlockManager::ClaimResult> WindowBlockManager::prepareSequenceBatch(
     std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
     std::vector<SizeType32> const& numContextBlocksVec,
     std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, bool isEnableBlockReuse)
 {
     auto const n = sequences.size();
     std::vector<ClaimResult> claimResults(n);
-    std::vector<BatchSeqStats> results(n);
 
-    // Hold the lock for the entire two-phase operation.
     std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
 
     if (isEnableBlockReuse)
@@ -1986,6 +1984,78 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         }
     }
 
+    return claimResults;
+}
+
+bool WindowBlockManager::hasPinnedSecondaryClaim(std::vector<ClaimResult> const& claimResults) const
+{
+    for (auto const& claimResult : claimResults)
+    {
+        for (auto const& claimed : claimResult.claimedBlocks)
+        {
+            auto const& block = claimed.block;
+            if (block == nullptr || claimed.isPlaceholder || claimed.isTraversalOnly || block->isPlaceholder())
+            {
+                continue;
+            }
+            if (!block->isPrimary() && block->hasRefs())
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void WindowBlockManager::rollbackSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences, std::vector<ClaimResult> const& claimResults)
+{
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+
+    std::set<KVCacheBlock::IdType> releasedBlockIds;
+    for (auto const& claimResult : claimResults)
+    {
+        for (auto const& claimed : claimResult.claimedBlocks)
+        {
+            auto const& block = claimed.block;
+            if (block == nullptr || claimed.isPlaceholder || claimed.isTraversalOnly || block->isPlaceholder())
+            {
+                continue;
+            }
+
+            auto const blockId = block->getBlockId();
+            if (releasedBlockIds.insert(blockId).second && !block->hasRefs())
+            {
+                mEvictionPolicy->releaseBlock(block);
+            }
+        }
+    }
+
+    for (auto* sequence : sequences)
+    {
+        auto const requestId = sequence->getRequestId();
+        auto seqIt = mAllocatedBlocksPerSeq.find(requestId);
+        if (seqIt == mAllocatedBlocksPerSeq.end())
+        {
+            continue;
+        }
+        TLLM_CHECK_WITH_INFO(seqIt->second.empty(),
+            "%s::rollbackSequenceBatch called after request %lu had blocks added", mLogPrefix.c_str(), requestId);
+        mAllocatedBlocksPerSeq.erase(seqIt);
+        sequence->clearCacheBlocks(mWindowSize);
+    }
+}
+
+std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::onboardAndAllocateSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, std::vector<ClaimResult>& claimResults,
+    bool isEnableBlockReuse)
+{
+    auto const n = sequences.size();
+    std::vector<BatchSeqStats> results(n);
+
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+
     // Phase 2: Onboard + allocate for each request, snapshotting stats between requests.
     for (size_t i = 0; i < n; ++i)
     {
@@ -2008,6 +2078,21 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
     // (held by the reuser or full-matcher), so they would be skipped anyway.
 
     return results;
+}
+
+std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
+    std::vector<SizeType32> const& numContextBlocksVec,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, bool isEnableBlockReuse)
+{
+    auto claimResults
+        = prepareSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, isEnableBlockReuse);
+    if (hasPinnedSecondaryClaim(claimResults))
+    {
+        rollbackSequenceBatch(sequences, claimResults);
+        return {};
+    }
+    return onboardAndAllocateSequenceBatch(sequences, llmRequests, claimResults, isEnableBlockReuse);
 }
 
 bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
@@ -2169,6 +2254,36 @@ std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
 {
     return mWindowBlockManagers.at(windowSize)
         .addSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, isEnableBlockReuse);
+}
+
+std::vector<WindowBlockManager::ClaimResult> BlockManager::prepareSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
+    std::vector<SizeType32> const& numContextBlocksVec,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize, bool isEnableBlockReuse)
+{
+    return mWindowBlockManagers.at(windowSize)
+        .prepareSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, isEnableBlockReuse);
+}
+
+bool BlockManager::hasPinnedSecondaryClaim(
+    SizeType32 windowSize, std::vector<WindowBlockManager::ClaimResult> const& claimResults) const
+{
+    return mWindowBlockManagers.at(windowSize).hasPinnedSecondaryClaim(claimResults);
+}
+
+void BlockManager::rollbackSequenceBatch(SizeType32 windowSize, std::vector<GenerationRequest*> const& sequences,
+    std::vector<WindowBlockManager::ClaimResult> const& claimResults)
+{
+    mWindowBlockManagers.at(windowSize).rollbackSequenceBatch(sequences, claimResults);
+}
+
+std::vector<WindowBlockManager::BatchSeqStats> BlockManager::onboardAndAllocateSequenceBatch(
+    std::vector<GenerationRequest*> const& sequences,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests,
+    std::vector<WindowBlockManager::ClaimResult>& claimResults, SizeType32 windowSize, bool isEnableBlockReuse)
+{
+    return mWindowBlockManagers.at(windowSize)
+        .onboardAndAllocateSequenceBatch(sequences, llmRequests, claimResults, isEnableBlockReuse);
 }
 
 void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
@@ -3649,14 +3764,16 @@ PrefixReuseSummary KVCacheManager::analyzePrefixReuse(
     return mBlockManager.analyzePrefixReuse(uniqueTokens, llmRequest);
 }
 
-void KVCacheManager::addSequenceBatch(
+bool KVCacheManager::addSequenceBatch(
     std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
     std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
 {
+    std::lock_guard<std::mutex> apiLock(mApiMtx);
+
     TLLM_CHECK(requestInfos.size() == llmRequests.size());
     if (requestInfos.empty())
     {
-        return;
+        return true;
     }
     auto const n = requestInfos.size();
 
@@ -3684,16 +3801,22 @@ void KVCacheManager::addSequenceBatch(
         sequences[i] = &seqIt->second;
     }
 
-    // Track the minimum prepopulated length across all windows per sequence
-    // (for VSWA with mixed isSWA flags).
-    std::vector<SizeType32> minPrepopulatedLen(n, std::numeric_limits<SizeType32>::max());
-    // Accumulate block allocation stats across all windows per sequence
-    std::vector<SizeType32> totalAllocTotalDelta(n, 0);
-    std::vector<SizeType32> totalAllocNewDelta(n, 0);
-    std::vector<SizeType32> totalReusedDelta(n, 0);
-    std::vector<SizeType32> totalMissedDelta(n, 0);
+    std::map<SizeType32, std::vector<WindowBlockManager::ClaimResult>> claimResultsByWindow;
+    auto rollbackPreparedWindows = [&]()
+    {
+        for (auto const& [windowSize, claimResults] : claimResultsByWindow)
+        {
+            mBlockManager.rollbackSequenceBatch(windowSize, sequences, claimResults);
+        }
 
-    // --- Iterate over all window sizes (single iteration for non-VSWA) ---
+        auto lck = std::scoped_lock(mSequencesMtx);
+        for (auto const& requestInfo : requestInfos)
+        {
+            mSequences.erase(std::get<0>(requestInfo));
+        }
+    };
+
+    // --- Phase 1: claim reusable blocks for all windows without publishing them to requests. ---
     for (auto const& [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
     {
         // Use maxTokenNum (= max(windowSize, maxSequenceLength) + sinkBubbleLength) as the cap.
@@ -3701,7 +3824,6 @@ void KVCacheManager::addSequenceBatch(
         // only detached during generation in adjustBlocksIfNeeded.
         auto const maxTokenNum = metadata.maxTokenNum;
 
-        // Compute per-sequence effective input length for this window
         std::vector<SizeType32> inputLengths(n);
         std::vector<SizeType32> numContextBlocksVec(n);
         for (size_t i = 0; i < n; ++i)
@@ -3711,9 +3833,38 @@ void KVCacheManager::addSequenceBatch(
             numContextBlocksVec[i] = tc::ceilDiv(inputLengths[i], getTokensPerBlock());
         }
 
-        // Two-phase claim-then-onboard for this window
-        auto const windowResults = mBlockManager.addSequenceBatch(
+        auto claimResults = mBlockManager.prepareSequenceBatch(
             sequences, inputLengths, numContextBlocksVec, llmRequests, windowSize, mEnableBlockReuse);
+        bool const hasPinnedSecondaryClaim = mBlockManager.hasPinnedSecondaryClaim(windowSize, claimResults);
+        bool const inserted = claimResultsByWindow.emplace(windowSize, std::move(claimResults)).second;
+        TLLM_CHECK(inserted);
+
+        if (hasPinnedSecondaryClaim)
+        {
+            rollbackPreparedWindows();
+            TLLM_LOG_DEBUG(
+                "KVCacheManager::addSequenceBatch: skipping %zu request(s) because a claimed secondary block is pinned",
+                n);
+            return false;
+        }
+    }
+
+    // Track the minimum prepopulated length across all windows per sequence
+    // (for VSWA with mixed isSWA flags).
+    std::vector<SizeType32> minPrepopulatedLen(n, std::numeric_limits<SizeType32>::max());
+    // Accumulate block allocation stats across all windows per sequence
+    std::vector<SizeType32> totalAllocTotalDelta(n, 0);
+    std::vector<SizeType32> totalAllocNewDelta(n, 0);
+    std::vector<SizeType32> totalReusedDelta(n, 0);
+    std::vector<SizeType32> totalMissedDelta(n, 0);
+
+    // --- Phase 2: onboard and allocate all prepared windows. ---
+    for (auto const& [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    {
+        auto& claimResults = claimResultsByWindow.at(windowSize);
+        auto const windowResults
+            = mBlockManager.onboardAndAllocateSequenceBatch(sequences, llmRequests, claimResults, windowSize,
+                mEnableBlockReuse);
 
         // Update offsets and accumulate stats
         for (size_t i = 0; i < n; ++i)
@@ -3749,6 +3900,8 @@ void KVCacheManager::addSequenceBatch(
         llmRequest.updateReusedBlocksPerRequest(totalReusedDelta[i]);
         llmRequest.updateMissedBlocksPerRequest(totalMissedDelta[i]);
     }
+
+    return true;
 }
 
 void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
@@ -3838,12 +3991,14 @@ void KVCacheManager::pinBlocks(RequestIdType requestId)
 
 void KVCacheManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
+    std::lock_guard<std::mutex> lock(mApiMtx);
     mBlockManager.unpinBlocksById(blockIds);
 }
 
 std::vector<std::pair<SizeType32, SizeType32>> KVCacheManager::pinBlocksById(
     std::vector<KVCacheBlock::IdType> const& blockIds)
 {
+    std::lock_guard<std::mutex> lock(mApiMtx);
     return mBlockManager.pinBlocksById(blockIds);
 }
 

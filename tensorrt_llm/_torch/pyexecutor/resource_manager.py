@@ -734,19 +734,34 @@ class KVCacheManager(BaseResourceManager):
                         batch_llm_requests.append(req)
                         batch_ctx_requests.append(req)
 
+            skipped_context_requests = []
             if batch_request_infos:
-                self.impl.add_sequence_batch(batch_request_infos,
-                                             batch_llm_requests)
-                for req in batch_ctx_requests:
-                    for _ in range(self.num_extra_kv_tokens):
-                        self.impl.add_token(req.py_request_id)
-                    for _ in range(get_draft_token_length(req)):
-                        self.impl.add_token(req.py_request_id)
+                admitted = self.impl.add_sequence_batch(batch_request_infos,
+                                                        batch_llm_requests)
+                if admitted:
+                    for req in batch_ctx_requests:
+                        for _ in range(self.num_extra_kv_tokens):
+                            self.impl.add_token(req.py_request_id)
+                        for _ in range(get_draft_token_length(req)):
+                            self.impl.add_token(req.py_request_id)
 
-                    if self.kv_connector_manager is not None:
-                        block_ids = self.get_cache_indices(req)
-                        self.kv_connector_manager.update_state_after_alloc(
-                            req, block_ids)
+                        if self.kv_connector_manager is not None:
+                            block_ids = self.get_cache_indices(req)
+                            self.kv_connector_manager.update_state_after_alloc(
+                                req, block_ids)
+                else:
+                    skipped_context_requests = batch_ctx_requests
+                    skipped_request_ids = {
+                        req.py_request_id
+                        for req in skipped_context_requests
+                    }
+                    scheduled_batch.reset_context_requests([
+                        req for req in scheduled_batch.context_requests
+                        if req.py_request_id not in skipped_request_ids
+                    ])
+                    logger.debug(
+                        "Skipping %d context request(s) this tick because a remote-G2 pin holds a secondary KV block",
+                        len(skipped_context_requests))
 
             # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in
             # `add_sequence_batch` due to KV cache reuse, so we rebuild the context request lists here.
@@ -775,6 +790,8 @@ class KVCacheManager(BaseResourceManager):
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
+
+        return skipped_context_requests
 
     def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
         """No-op for V1; interface kept consistent with V2."""
@@ -859,8 +876,11 @@ class KVCacheManager(BaseResourceManager):
         # This must happen before is_gen state modifications below, which may
         # set prompt_len to 0 and trigger assertion in setPrepopulatedPromptLen.
         if batch_request_infos:
-            self.impl.add_sequence_batch(batch_request_infos,
-                                         batch_llm_requests)
+            admitted = self.impl.add_sequence_batch(batch_request_infos,
+                                                    batch_llm_requests)
+            if not admitted:
+                raise RuntimeError(
+                    "Unable to admit dummy KV cache requests because a secondary KV block is pinned")
             for req_id, token_num, _ in batch_request_infos:
                 for _ in range(self.num_extra_kv_tokens):
                     self.impl.add_token(req_id)
@@ -868,8 +888,11 @@ class KVCacheManager(BaseResourceManager):
                     self.impl.add_token(req_id)
 
         if draft_batch_request_infos and draft_kv_cache_manager is not None:
-            draft_kv_cache_manager.impl.add_sequence_batch(
+            admitted = draft_kv_cache_manager.impl.add_sequence_batch(
                 draft_batch_request_infos, draft_batch_llm_requests)
+            if not admitted:
+                raise RuntimeError(
+                    "Unable to admit draft dummy KV cache requests because a secondary KV block is pinned")
             for req_id, _, _ in draft_batch_request_infos:
                 for _ in range(self.num_extra_kv_tokens):
                     draft_kv_cache_manager.impl.add_token(req_id)
@@ -3079,9 +3102,13 @@ class ResourceManager:
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        skipped_context_requests = []
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
-                resource_manager.prepare_resources(scheduled_batch)
+                result = resource_manager.prepare_resources(scheduled_batch)
+                if result:
+                    skipped_context_requests.extend(result)
+        return skipped_context_requests
 
     @nvtx_range("update_resources")
     def update_resources(

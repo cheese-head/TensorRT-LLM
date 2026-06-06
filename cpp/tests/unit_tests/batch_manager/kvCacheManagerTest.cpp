@@ -46,6 +46,7 @@
 #include <filesystem>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <sys/types.h>
 #include <thread>
 #include <unistd.h>
@@ -4955,6 +4956,91 @@ TEST_F(KVCacheManagerTest, FindAndPinBlocksByHashReportsTierAndPinsHostPinned)
     ASSERT_EQ(wrongWindow.size(), 1);
     EXPECT_FALSE(wrongWindow[0].pinned);
     EXPECT_FALSE(wrongWindow[0].foundTier.has_value());
+}
+
+TEST_F(KVCacheManagerTest, AddSequenceBatchSkipsPinnedSecondaryBlock)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 4;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr beamWidth = 1;
+    auto const maxAttentionWindow = tokensPerBlock * blocksInPrimaryPool;
+
+    BlocksPerWindow const blocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
+        maxNumSequences, beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
+        nvinfer1::DataType::kHALF, 0, stream, maxAttentionWindow, maxAttentionWindow, true);
+    kvCacheManager.allocatePools(false);
+
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
+    auto seedRequest = std::make_shared<LlmRequest>(0, 0, inputTokens, samplingConfig, isStreaming);
+
+    EXPECT_TRUE(kvCacheManager.addSequenceBatch(
+        {{{0, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*seedRequest)}));
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seedRequest);
+    kvCacheManager.storeContextBlocks(*seedRequest);
+
+    auto const blockIds = kvCacheManager.getCacheBlockIds(0, maxAttentionWindow)[0];
+    ASSERT_GE(blockIds.size(), 1);
+    auto const& blockManager = kvCacheManager.getBlockManager();
+    (void) kvCacheManager.removeSequence(0, seedRequest);
+
+    auto pressureTokens = std::make_shared<VecTokens>(
+        VecTokens{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25});
+    auto pressureRequest = std::make_shared<LlmRequest>(1, 0, pressureTokens, samplingConfig, isStreaming);
+    EXPECT_TRUE(kvCacheManager.addSequenceBatch(
+        {{{1, static_cast<SizeType32>(pressureTokens->size()), beamWidth}}}, {std::ref(*pressureRequest)}));
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*pressureRequest);
+    kvCacheManager.storeContextBlocks(*pressureRequest);
+
+    KVCacheBlock::IdType pinnedBlockId{-1};
+    for (auto const blockId : blockIds)
+    {
+        auto block = blockManager.getBlockById(blockId, maxAttentionWindow);
+        if (block == nullptr || block->isPrimary())
+        {
+            continue;
+        }
+        auto results = kvCacheManager.findAndPinBlocksByHash(
+            {block->getHash()}, CachePoolTier::kHostPinned, true, maxAttentionWindow);
+        ASSERT_EQ(results.size(), 1);
+        if (results[0].pinned)
+        {
+            pinnedBlockId = results[0].blockId;
+            break;
+        }
+    }
+    ASSERT_GE(pinnedBlockId, 0) << "pressure workload did not migrate any seed block to secondary";
+    auto pinnedBlock = blockManager.getBlockById(pinnedBlockId, maxAttentionWindow);
+    ASSERT_NE(pinnedBlock, nullptr);
+    ASSERT_TRUE(pinnedBlock->hasRefs());
+    ASSERT_FALSE(pinnedBlock->isPrimary());
+
+    auto const freeBlocksAfterPin = kvCacheManager.getNumFreeBlocks();
+    auto retryRequest = std::make_shared<LlmRequest>(2, 0, inputTokens, samplingConfig, isStreaming);
+    EXPECT_FALSE(kvCacheManager.addSequenceBatch(
+        {{{2, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*retryRequest)}));
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), freeBlocksAfterPin);
+    EXPECT_EQ(retryRequest->getContextCurrentPosition(), 0);
+    EXPECT_TRUE(pinnedBlock->hasRefs());
+    EXPECT_FALSE(pinnedBlock->isPrimary());
+    EXPECT_THROW((void) kvCacheManager.getSequence(2), std::out_of_range);
+
+    kvCacheManager.unpinBlocksById({pinnedBlockId});
+    EXPECT_TRUE(kvCacheManager.addSequenceBatch(
+        {{{2, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*retryRequest)}));
+    EXPECT_FALSE(kvCacheManager.getCacheBlockIds(2, maxAttentionWindow)[0].empty());
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*retryRequest);
+    (void) kvCacheManager.removeSequence(2, retryRequest);
 }
 
 // Regression test for NVBug 6018647: storeBlocks(pin=true) on a zero-ref block

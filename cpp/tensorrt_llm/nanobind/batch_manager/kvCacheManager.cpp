@@ -147,7 +147,7 @@ public:
         NB_OVERRIDE_PURE(getTokenCount, requestId);
     }
 
-    void addSequenceBatch(
+    bool addSequenceBatch(
         std::vector<std::tuple<tb::LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
         std::vector<std::reference_wrapper<tb::LlmRequest>> const& llmRequests) override
     {
@@ -476,8 +476,12 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                     llmRequests.push_back(std::ref(nb::cast<tb::LlmRequest&>(llmRequestsList[i])));
                 }
                 // Release GIL only for the C++ call.
-                nb::gil_scoped_release release;
-                self.addSequenceBatch(requestInfos, llmRequests);
+                bool admitted;
+                {
+                    nb::gil_scoped_release release;
+                    admitted = self.addSequenceBatch(requestInfos, llmRequests);
+                }
+                return admitted;
             },
             nb::arg("request_infos"), nb::arg("llm_requests"))
         .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::call_guard<nb::gil_scoped_release>())

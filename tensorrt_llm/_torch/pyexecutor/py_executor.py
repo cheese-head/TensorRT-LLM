@@ -1605,90 +1605,99 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
-
-                    # The generation requests that do not have batch_idx
-                    # need to be in front of the batch due to the assumptions
-                    # made in model_engine.py::_forward_step. This is only important
-                    # for disaggregated serving. For non-disaggregated serving,
-                    # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
-
-                    if self.kv_cache_transceiver:
-                        # Return the first token to the client
-                        self._handle_first_token_response(scheduled_batch)
-
-                    # Stage 1.1: Async forward (all ranks) and decoding pass (last rank only)
-                    if not self.dist.is_last_pp_rank:
-                        with torch.cuda.nvtx.range(
-                                f"_forward_step_inter_pp pp_rank {self.dist.pp_rank}"
-                        ):
-                            sample_state = self._forward_step_inter_pp(
-                                scheduled_batch)
+                    skipped_context_requests = self.resource_manager.prepare_resources(
+                        scheduled_batch)
+                    if skipped_context_requests:
+                        for req in skipped_context_requests:
+                            self.inflight_req_ids.erase(req.request_id)
+                    if scheduled_batch.batch_size == 0:
+                        logger.debug(
+                            "Skipping forward because no scheduled requests were admitted this tick")
+                        can_queue = False
+                        self.micro_batches[microbatch_id] = None
                     else:
-                        with torch.cuda.nvtx.range(
-                                f"_forward_step_last_pp pp_rank {self.dist.pp_rank}"
-                        ):
-                            # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
-                            if self.guided_decoder is not None and self.kv_cache_transceiver:
-                                self.guided_decoder.add_batch(scheduled_batch)
-                                self.guided_decoder.init_disagg_gen_requests()
+                        # The generation requests that do not have batch_idx
+                        # need to be in front of the batch due to the assumptions
+                        # made in model_engine.py::_forward_step. This is only important
+                        # for disaggregated serving. For non-disaggregated serving,
+                        # the generation requests always have batch_idx.
+                        scheduled_batch.generation_requests = sorted(  # stable sort
+                            scheduled_batch.generation_requests,
+                            key=lambda req: int(req.py_batch_idx is not None),
+                        )
 
-                            batch_outputs = self._forward_step(scheduled_batch)
+                        if self.kv_cache_transceiver:
+                            # Return the first token to the client
+                            self._handle_first_token_response(scheduled_batch)
 
-                            guided_decoder_failed_requests = None
-                            if self.guided_decoder is not None:
-                                self.guided_decoder.add_batch(scheduled_batch)
-                                guided_decoder_failed_requests = self.guided_decoder.execute(
-                                    batch_outputs['logits'])
+                        # Stage 1.1: Async forward (all ranks) and decoding pass (last rank only)
+                        if not self.dist.is_last_pp_rank:
+                            with torch.cuda.nvtx.range(
+                                    f"_forward_step_inter_pp pp_rank {self.dist.pp_rank}"
+                            ):
+                                sample_state = self._forward_step_inter_pp(
+                                    scheduled_batch)
+                        else:
+                            with torch.cuda.nvtx.range(
+                                    f"_forward_step_last_pp pp_rank {self.dist.pp_rank}"
+                            ):
+                                # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
+                                if self.guided_decoder is not None and self.kv_cache_transceiver:
+                                    self.guided_decoder.add_batch(scheduled_batch)
+                                    self.guided_decoder.init_disagg_gen_requests()
 
-                            if self.pp_multi_stream_sample:
-                                # Wait for the previous sample to finish.
-                                self.finish_sample_event.wait()
-                                # Copy the batch outputs as sampler inputs
-                                # to avoid next forward step overwriting them.
-                                batch_outputs_copy = {
-                                    name: tensor.clone()
-                                    for name, tensor in batch_outputs.items()
-                                }
-                                self.sample_stream.wait_stream(
-                                    torch.cuda.current_stream())
-                                with torch.cuda.stream(self.sample_stream):
+                                batch_outputs = self._forward_step(scheduled_batch)
+
+                                guided_decoder_failed_requests = None
+                                if self.guided_decoder is not None:
+                                    self.guided_decoder.add_batch(scheduled_batch)
+                                    guided_decoder_failed_requests = self.guided_decoder.execute(
+                                        batch_outputs['logits'])
+
+                                if self.pp_multi_stream_sample:
+                                    # Wait for the previous sample to finish.
+                                    self.finish_sample_event.wait()
+                                    # Copy the batch outputs as sampler inputs
+                                    # to avoid next forward step overwriting them.
+                                    batch_outputs_copy = {
+                                        name: tensor.clone()
+                                        for name, tensor in batch_outputs.items()
+                                    }
+                                    self.sample_stream.wait_stream(
+                                        torch.cuda.current_stream())
+                                    with torch.cuda.stream(self.sample_stream):
+                                        sample_state = self._sample_async(
+                                            scheduled_batch, batch_outputs_copy)
+                                        self.finish_sample_event.record()
+                                else:
                                     sample_state = self._sample_async(
-                                        scheduled_batch, batch_outputs_copy)
-                                    self.finish_sample_event.record()
-                            else:
-                                sample_state = self._sample_async(
-                                    scheduled_batch, batch_outputs)
+                                        scheduled_batch, batch_outputs)
 
-                            assert sample_state is not None, "Sampling failed"
+                                assert sample_state is not None, "Sampling failed"
 
-                            # Handle guided decoder errors after _sample_async to avoid state conflicts.
-                            # If called before, failed requests would be marked as GENERATION_COMPLETE,
-                            # causing _sample_async to fail when accessing context_chunk_size property.
-                            self._handle_guided_decoder_errors(
-                                scheduled_batch, guided_decoder_failed_requests)
+                                # Handle guided decoder errors after _sample_async to avoid state conflicts.
+                                # If called before, failed requests would be marked as GENERATION_COMPLETE,
+                                # causing _sample_async to fail when accessing context_chunk_size property.
+                                self._handle_guided_decoder_errors(
+                                    scheduled_batch, guided_decoder_failed_requests)
 
-                            self._update_request_states(scheduled_batch)
-                            if not self.disable_overlap_scheduler:
-                                self._update_generation_requests_that_will_complete_next_iteration(
-                                    scheduled_batch.generation_requests)
+                                self._update_request_states(scheduled_batch)
+                                if not self.disable_overlap_scheduler:
+                                    self._update_generation_requests_that_will_complete_next_iteration(
+                                        scheduled_batch.generation_requests)
 
-                    if self.enable_iter_perf_stats:
-                        iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
-                            'num_ctx_tokens']
-                    batch_state = BatchStatePP(
-                        scheduled_requests=scheduled_batch,
-                        sample_state=sample_state,
-                        iter_start_time=iter_start_time,
-                        iter_stats=iter_stats,
-                        microbatch_id=microbatch_id,
-                    )
+                        if self.enable_iter_perf_stats:
+                            iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
+                                'num_ctx_tokens']
+                        batch_state = BatchStatePP(
+                            scheduled_requests=scheduled_batch,
+                            sample_state=sample_state,
+                            iter_start_time=iter_start_time,
+                            iter_stats=iter_stats,
+                            microbatch_id=microbatch_id,
+                        )
 
-                    self.micro_batches[microbatch_id] = batch_state
+                        self.micro_batches[microbatch_id] = batch_state
 
                 # Stage 1.2: Sync sampler for previous microbatch to start new sample state comm chain.
                 # For last PP rank, we must synchronize the previous batch
@@ -2251,7 +2260,15 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    skipped_context_requests = self.resource_manager.prepare_resources(
+                        scheduled_batch)
+                    if skipped_context_requests:
+                        for req in skipped_context_requests:
+                            self.inflight_req_ids.erase(req.request_id)
+                    if scheduled_batch.batch_size == 0:
+                        logger.debug(
+                            "Skipping forward because no scheduled requests were admitted this tick")
+                        can_queue = False
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -2262,6 +2279,8 @@ class PyExecutor:
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
                     can_queue, _ = self._can_queue(scheduled_batch)
+                    if scheduled_batch.batch_size == 0:
+                        can_queue = False
 
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
@@ -2506,7 +2525,15 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    skipped_context_requests = self.resource_manager.prepare_resources(
+                        scheduled_batch)
+                    if skipped_context_requests:
+                        for req in skipped_context_requests:
+                            self.inflight_req_ids.erase(req.request_id)
+                    if scheduled_batch.batch_size == 0:
+                        logger.debug(
+                            "Skipping forward because no scheduled requests were admitted this tick")
+                        can_queue = False
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -2518,6 +2545,9 @@ class PyExecutor:
                 if self.kv_connector_manager:
                     can_queue, can_queue_this_rank = self._can_queue(
                         scheduled_batch)
+                    if scheduled_batch.batch_size == 0:
+                        can_queue = False
+                        can_queue_this_rank = False
 
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
