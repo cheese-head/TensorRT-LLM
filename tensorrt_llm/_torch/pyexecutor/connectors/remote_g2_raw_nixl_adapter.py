@@ -207,15 +207,6 @@ class RawNixlRemoteG2Adapter:
         # remote handles to come from prep_xfer_dlist.
         self._peer_handles: dict[tuple[str, int], tuple[Any, Any]] = {}
 
-        logging.warning(
-            "PROBE remote_g2_raw_target_adapter: agent_name=%s primary_pool_base=0x%x "
-            "primary_pool_size=%d device_id=%d",
-            agent_name,
-            primary_pool_base_ptr,
-            primary_pool_size_bytes,
-            device_id,
-        )
-
     def _ensure_peer_loaded(
         self,
         source_meta: dict,
@@ -289,11 +280,6 @@ class RawNixlRemoteG2Adapter:
         )
 
         self._peer_handles[key] = (local_handle, remote_handle)
-        logging.warning(
-            "PROBE remote_g2_raw_peer_loaded peer=%s gen=%d "
-            "local_blocks=%d remote_blocks=%d",
-            peer_name, peer_generation, num_blocks, remote_num_blocks,
-        )
         return local_handle, remote_handle
 
     def start_transfer(self, record):
@@ -441,11 +427,6 @@ class RawNixlRemoteG2Adapter:
         finally:
             if _nvtx is not None:
                 _nvtx.range_pop()
-        logging.warning(
-            "PROBE remote_g2_raw_transfer_submitted request_id=%s initial_state=%s",
-            record.request_id, state,
-        )
-
         return _RawNixlTransferResult(
             agent=self._agent,
             handle=handle,
@@ -460,25 +441,9 @@ class _RawNixlTransferResult:
     record: Any
     _released: bool = False
 
-    _poll_count: int = 0
-
     def is_completed(self) -> bool:
         state = self.agent.check_xfer_state(self.handle)
-        self._poll_count += 1
-        # Log first poll, every 100th, and any non-PROC state — keeps
-        # noise low while making completion visible.
         state_str = str(state).upper()
-        if (
-            self._poll_count == 1
-            or self._poll_count % 100 == 0
-            or state_str not in ("PROC", "PROCESSING", "PENDING")
-        ):
-            logging.warning(
-                "PROBE remote_g2_raw_is_completed request_id=%s poll=%d state=%s",
-                getattr(self.record, "request_id", "?"),
-                self._poll_count,
-                state_str,
-            )
         return state_str in ("DONE", "SUCCESS")
 
     def is_failed(self) -> bool:
