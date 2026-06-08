@@ -736,8 +736,13 @@ class KVCacheManager(BaseResourceManager):
 
             skipped_context_requests = []
             if batch_request_infos:
-                admitted = self.impl.try_add_sequence_batch(batch_request_infos,
-                                                            batch_llm_requests)
+                if self._requires_retryable_kv_admission():
+                    admitted = self.impl.try_add_sequence_batch(
+                        batch_request_infos, batch_llm_requests)
+                else:
+                    self.impl.add_sequence_batch(batch_request_infos,
+                                                 batch_llm_requests)
+                    admitted = True
                 if admitted:
                     for req in batch_ctx_requests:
                         for _ in range(self.num_extra_kv_tokens):
@@ -799,6 +804,10 @@ class KVCacheManager(BaseResourceManager):
     def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
         return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
             request)
+
+    def _requires_retryable_kv_admission(self) -> bool:
+        return (self.kv_connector_manager is not None
+                and self.kv_connector_manager.requires_retryable_kv_admission)
 
     def add_dummy_requests(
         self,
