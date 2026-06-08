@@ -1946,8 +1946,9 @@ public:
         = 0;
 
     //! \brief Retryable variant of addSequenceBatch.
-    //! \return True if all requests were admitted; false if admission was rolled back because a secondary
-    //!         block needed for onboard is pinned by another API user.
+    //! \return True if all requests were admitted. Implementations that support retryable admission may return false
+    //!         after rolling back admission, for example when a secondary block needed for onboard is pinned by another
+    //!         API user. The default preserves legacy must-admit behavior.
     virtual bool tryAddSequenceBatch(
         std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
