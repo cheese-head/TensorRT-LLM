@@ -2194,6 +2194,11 @@ std::vector<CacheLookupResult> WindowBlockManager::findAndPinBlocksByHash(
             // lookup-tree to secondary-slot pointer is committed at offload() time,
             // but the actual primary to secondary copy is queued on the offload
             // stream and not yet visible to a NIXL/RDMA reader.
+            // This currently runs while the API and lookup-tree mutexes are held,
+            // so a slow offload can stall scheduler admission. A future refinement
+            // can split the operation into find+pin+slot capture under the locks,
+            // then wait before returning descriptors once pending-write tracking is
+            // safe to query outside the KVCM API critical section.
             mTransferManager->waitForPendingWrite(slotIdx);
         }
 
@@ -3764,7 +3769,17 @@ PrefixReuseSummary KVCacheManager::analyzePrefixReuse(
     return mBlockManager.analyzePrefixReuse(uniqueTokens, llmRequest);
 }
 
-bool KVCacheManager::addSequenceBatch(
+void KVCacheManager::addSequenceBatch(
+    std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
+    std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
+{
+    bool const admitted = tryAddSequenceBatch(requestInfos, llmRequests);
+    TLLM_CHECK_WITH_INFO(admitted,
+        "KVCacheManager::addSequenceBatch could not admit the request batch; use tryAddSequenceBatch for retryable "
+        "admission");
+}
+
+bool KVCacheManager::tryAddSequenceBatch(
     std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
     std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
 {
@@ -3842,8 +3857,8 @@ bool KVCacheManager::addSequenceBatch(
         if (hasPinnedSecondaryClaim)
         {
             rollbackPreparedWindows();
-            TLLM_LOG_DEBUG(
-                "KVCacheManager::addSequenceBatch: skipping %zu request(s) because a claimed secondary block is pinned",
+            TLLM_LOG_DEBUG("KVCacheManager::tryAddSequenceBatch: skipping %zu request(s) because a claimed "
+                           "secondary block is pinned",
                 n);
             return false;
         }

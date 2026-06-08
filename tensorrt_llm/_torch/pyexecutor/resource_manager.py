@@ -736,8 +736,8 @@ class KVCacheManager(BaseResourceManager):
 
             skipped_context_requests = []
             if batch_request_infos:
-                admitted = self.impl.add_sequence_batch(batch_request_infos,
-                                                        batch_llm_requests)
+                admitted = self.impl.try_add_sequence_batch(batch_request_infos,
+                                                            batch_llm_requests)
                 if admitted:
                     for req in batch_ctx_requests:
                         for _ in range(self.num_extra_kv_tokens):
@@ -876,11 +876,8 @@ class KVCacheManager(BaseResourceManager):
         # This must happen before is_gen state modifications below, which may
         # set prompt_len to 0 and trigger assertion in setPrepopulatedPromptLen.
         if batch_request_infos:
-            admitted = self.impl.add_sequence_batch(batch_request_infos,
-                                                    batch_llm_requests)
-            if not admitted:
-                raise RuntimeError(
-                    "Unable to admit dummy KV cache requests because a secondary KV block is pinned")
+            self.impl.add_sequence_batch(batch_request_infos,
+                                         batch_llm_requests)
             for req_id, token_num, _ in batch_request_infos:
                 for _ in range(self.num_extra_kv_tokens):
                     self.impl.add_token(req_id)
@@ -888,11 +885,8 @@ class KVCacheManager(BaseResourceManager):
                     self.impl.add_token(req_id)
 
         if draft_batch_request_infos and draft_kv_cache_manager is not None:
-            admitted = draft_kv_cache_manager.impl.add_sequence_batch(
+            draft_kv_cache_manager.impl.add_sequence_batch(
                 draft_batch_request_infos, draft_batch_llm_requests)
-            if not admitted:
-                raise RuntimeError(
-                    "Unable to admit draft dummy KV cache requests because a secondary KV block is pinned")
             for req_id, _, _ in draft_batch_request_infos:
                 for _ in range(self.num_extra_kv_tokens):
                     draft_kv_cache_manager.impl.add_token(req_id)

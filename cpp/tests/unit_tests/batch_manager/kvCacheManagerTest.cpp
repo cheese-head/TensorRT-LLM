@@ -4983,8 +4983,8 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchSkipsPinnedSecondaryBlock)
     auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
     auto seedRequest = std::make_shared<LlmRequest>(0, 0, inputTokens, samplingConfig, isStreaming);
 
-    EXPECT_TRUE(kvCacheManager.addSequenceBatch(
-        {{{0, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*seedRequest)}));
+    kvCacheManager.addSequenceBatch(
+        {{{0, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*seedRequest)});
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seedRequest);
     kvCacheManager.storeContextBlocks(*seedRequest);
 
@@ -4996,8 +4996,8 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchSkipsPinnedSecondaryBlock)
     auto pressureTokens = std::make_shared<VecTokens>(
         VecTokens{10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25});
     auto pressureRequest = std::make_shared<LlmRequest>(1, 0, pressureTokens, samplingConfig, isStreaming);
-    EXPECT_TRUE(kvCacheManager.addSequenceBatch(
-        {{{1, static_cast<SizeType32>(pressureTokens->size()), beamWidth}}}, {std::ref(*pressureRequest)}));
+    kvCacheManager.addSequenceBatch(
+        {{{1, static_cast<SizeType32>(pressureTokens->size()), beamWidth}}}, {std::ref(*pressureRequest)});
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*pressureRequest);
     kvCacheManager.storeContextBlocks(*pressureRequest);
 
@@ -5026,7 +5026,7 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchSkipsPinnedSecondaryBlock)
 
     auto const freeBlocksAfterPin = kvCacheManager.getNumFreeBlocks();
     auto retryRequest = std::make_shared<LlmRequest>(2, 0, inputTokens, samplingConfig, isStreaming);
-    EXPECT_FALSE(kvCacheManager.addSequenceBatch(
+    EXPECT_FALSE(kvCacheManager.tryAddSequenceBatch(
         {{{2, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*retryRequest)}));
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), freeBlocksAfterPin);
     EXPECT_EQ(retryRequest->getContextCurrentPosition(), 0);
@@ -5035,7 +5035,7 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchSkipsPinnedSecondaryBlock)
     EXPECT_THROW((void) kvCacheManager.getSequence(2), std::out_of_range);
 
     kvCacheManager.unpinBlocksById({pinnedBlockId});
-    EXPECT_TRUE(kvCacheManager.addSequenceBatch(
+    EXPECT_TRUE(kvCacheManager.tryAddSequenceBatch(
         {{{2, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*retryRequest)}));
     EXPECT_FALSE(kvCacheManager.getCacheBlockIds(2, maxAttentionWindow)[0].empty());
 

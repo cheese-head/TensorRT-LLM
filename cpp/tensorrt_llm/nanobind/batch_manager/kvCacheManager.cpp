@@ -147,7 +147,7 @@ public:
         NB_OVERRIDE_PURE(getTokenCount, requestId);
     }
 
-    bool addSequenceBatch(
+    void addSequenceBatch(
         std::vector<std::tuple<tb::LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
         std::vector<std::reference_wrapper<tb::LlmRequest>> const& llmRequests) override
     {
@@ -476,10 +476,31 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                     llmRequests.push_back(std::ref(nb::cast<tb::LlmRequest&>(llmRequestsList[i])));
                 }
                 // Release GIL only for the C++ call.
+                nb::gil_scoped_release release;
+                self.addSequenceBatch(requestInfos, llmRequests);
+            },
+            nb::arg("request_infos"), nb::arg("llm_requests"))
+        .def(
+            "try_add_sequence_batch",
+            [](tbk::BaseKVCacheManager& self, nb::list requestInfosList, nb::list llmRequestsList)
+            {
+                // Marshal Python inputs while GIL is held.
+                std::vector<std::tuple<tb::LlmRequest::RequestIdType, SizeType32, SizeType32>> requestInfos;
+                std::vector<std::reference_wrapper<tb::LlmRequest>> llmRequests;
+                requestInfos.reserve(nb::len(requestInfosList));
+                llmRequests.reserve(nb::len(llmRequestsList));
+                for (size_t i = 0; i < nb::len(requestInfosList); ++i)
+                {
+                    auto info = nb::cast<nb::tuple>(requestInfosList[i]);
+                    requestInfos.emplace_back(nb::cast<tb::LlmRequest::RequestIdType>(info[0]),
+                        nb::cast<SizeType32>(info[1]), nb::cast<SizeType32>(info[2]));
+                    llmRequests.push_back(std::ref(nb::cast<tb::LlmRequest&>(llmRequestsList[i])));
+                }
+                // Release GIL only for the C++ call.
                 bool admitted;
                 {
                     nb::gil_scoped_release release;
-                    admitted = self.addSequenceBatch(requestInfos, llmRequests);
+                    admitted = self.tryAddSequenceBatch(requestInfos, llmRequests);
                 }
                 return admitted;
             },

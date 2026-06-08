@@ -1940,12 +1940,21 @@ public:
     //!          is disabled, buildClaimResultMetadata() prepares ClaimResult metadata without radix
     //!          tree traversal, and Phase 2 performs fresh allocation only. Supports variable sliding
     //!          window attention (VSWA) by iterating over all window sizes.
-    //! \return True if all requests were admitted; false if admission was rolled back because a secondary
-    //!         block needed for onboard is pinned by another API user.
-    virtual bool addSequenceBatch(
+    virtual void addSequenceBatch(
         std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
         = 0;
+
+    //! \brief Retryable variant of addSequenceBatch.
+    //! \return True if all requests were admitted; false if admission was rolled back because a secondary
+    //!         block needed for onboard is pinned by another API user.
+    virtual bool tryAddSequenceBatch(
+        std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
+    {
+        addSequenceBatch(requestInfos, llmRequests);
+        return true;
+    }
 
     [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> removeSequence(LlmRequest::RequestIdType requestId,
         OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinOnRelease = false)
@@ -2312,7 +2321,11 @@ public:
     //! the placeholder block). It should be called before every forward step, after adding new tokens.
     void copyLinearAttentionBlock(LlmRequest const& llmRequest);
 
-    bool addSequenceBatch(
+    void addSequenceBatch(
+        std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests) override;
+
+    bool tryAddSequenceBatch(
         std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests) override;
 
