@@ -627,6 +627,19 @@ class PyExecutor:
                 raise ValueError(
                     "KV Cache Connector requires a KV Cache Manager.")
 
+            if (self.kv_connector_manager.requires_disable_overlap_scheduler
+                    and not self.disable_overlap_scheduler):
+                raise NotImplementedError(
+                    "The selected KV Cache Connector requires disable_overlap_scheduler=True; "
+                    "overlap scheduler retryable KV admission is not validated.")
+
+            if (self.kv_connector_manager.requires_uniform_attention_window
+                    and (self.kv_cache_manager.is_vswa
+                         or self.kv_cache_manager.is_linear_attention)):
+                raise NotImplementedError(
+                    "The selected KV Cache Connector requires a single non-linear attention window; "
+                    "VSWA and linear-attention KV cache layouts are not validated.")
+
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
             # Start the remote-G2 source-side service here, in the engine
             # subprocess where kv_cache_manager is directly reachable. The
