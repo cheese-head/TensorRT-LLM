@@ -19,6 +19,9 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 
+#include <mutex>
+#include <unordered_map>
+
 namespace tr = tensorrt_llm::runtime;
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
@@ -80,11 +83,16 @@ public:
     //! \details Offload DMAs are queued asynchronously on mOffloadManager's stream and the
     //! corresponding tr::CudaEvent is stashed in mPendingWrites at offload() time. Code paths
     //! that read the destination slot OUTSIDE of any CUDA stream — notably NIXL/RDMA-driven
-    //! cross-process reads of host-pinned secondary blocks — must call this before reading,
-    //! otherwise the network adapter can pull the slot's pre-offload (stale) contents.
+    //! cross-process reads of host-pinned secondary blocks — must ensure the write is complete
+    //! before reading, otherwise the network adapter can pull the slot's pre-offload contents.
     //! No-op when there is no pending write for the slot. The pending-write entry is erased
     //! on successful synchronization so subsequent callers do not pay the cost again.
     void waitForPendingWrite(kernels::KVCacheIndex::UnderlyingType slotIdx);
+
+    //! \brief Return whether a pending offload write has completed without blocking.
+    //! \details Returns true when there is no pending write for the slot or when cudaEventQuery reports completion.
+    //!          The pending-write entry is erased only on completion. Returns false when the write is still in flight.
+    [[nodiscard]] bool isPendingWriteComplete(kernels::KVCacheIndex::UnderlyingType slotIdx);
 
 private:
     //! \brief Get pointer to pool specified by cache block.
@@ -120,6 +128,7 @@ private:
 
     // Track reads and writes for blocks. Note that it is the memory pool index that
     // identifies the raw memory blocks involved in I/O, not the block Id.
+    mutable std::mutex mPendingTransfersMutex;
     std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingReads;
     std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingWrites;
     // Reference to parent loopback agent

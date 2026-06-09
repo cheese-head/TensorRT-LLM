@@ -273,26 +273,29 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
-    // Wait for any pending writes before reading from offloadedBlock
-    auto offloadedBlockPendingWriteItr = mPendingWrites.find(offloadedBlock->getMemoryPoolBlockIndex());
-    if (offloadedBlockPendingWriteItr != mPendingWrites.end())
     {
-        mOnboardManager.getStream().wait(offloadedBlockPendingWriteItr->second);
-        // Don't erase, we are not changing state of offloadedBlock
-    }
-    // Wait for any pending reads before overwriting block
-    auto blockPendingReadItr = mPendingReads.find(block->getMemoryPoolBlockIndex());
-    if (blockPendingReadItr != mPendingReads.end())
-    {
-        mOnboardManager.getStream().wait(blockPendingReadItr->second);
-        mPendingReads.erase(blockPendingReadItr);
-    }
-    // Wait for any pending writes before overwriting block
-    auto blockPendingWriteItr = mPendingWrites.find(block->getMemoryPoolBlockIndex());
-    if (blockPendingWriteItr != mPendingWrites.end())
-    {
-        mOnboardManager.getStream().wait(blockPendingWriteItr->second);
-        mPendingWrites.erase(blockPendingWriteItr);
+        std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+        // Wait for any pending writes before reading from offloadedBlock
+        auto offloadedBlockPendingWriteItr = mPendingWrites.find(offloadedBlock->getMemoryPoolBlockIndex());
+        if (offloadedBlockPendingWriteItr != mPendingWrites.end())
+        {
+            mOnboardManager.getStream().wait(offloadedBlockPendingWriteItr->second);
+            // Don't erase, we are not changing state of offloadedBlock
+        }
+        // Wait for any pending reads before overwriting block
+        auto blockPendingReadItr = mPendingReads.find(block->getMemoryPoolBlockIndex());
+        if (blockPendingReadItr != mPendingReads.end())
+        {
+            mOnboardManager.getStream().wait(blockPendingReadItr->second);
+            mPendingReads.erase(blockPendingReadItr);
+        }
+        // Wait for any pending writes before overwriting block
+        auto blockPendingWriteItr = mPendingWrites.find(block->getMemoryPoolBlockIndex());
+        if (blockPendingWriteItr != mPendingWrites.end())
+        {
+            mOnboardManager.getStream().wait(blockPendingWriteItr->second);
+            mPendingWrites.erase(blockPendingWriteItr);
+        }
     }
 
     copyBlock(offloadedBlock, block, pools, false, numTokensToCopy, mode, directory);
@@ -313,38 +316,44 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadedBlock, BlockPtr co
         }
     }
 
-    // Record new pending read from offloadedBlock
-    mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOnboardManager.getStream().record(mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()]);
-    // Record new pending write to block
-    mPendingWrites[block->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOnboardManager.getStream().record(mPendingWrites[block->getMemoryPoolBlockIndex()]);
+    {
+        std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+        // Record new pending read from offloadedBlock
+        mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()] = tr::CudaEvent();
+        mOnboardManager.getStream().record(mPendingReads[offloadedBlock->getMemoryPoolBlockIndex()]);
+        // Record new pending write to block
+        mPendingWrites[block->getMemoryPoolBlockIndex()] = tr::CudaEvent();
+        mOnboardManager.getStream().record(mPendingWrites[block->getMemoryPoolBlockIndex()]);
+    }
 }
 
 void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offloadBlock,
     std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::string const& directory)
 {
-    // Wait for any pending writes before reading from block
-    auto blockPendingWriteItr = mPendingWrites.find(block->getMemoryPoolBlockIndex());
-    if (blockPendingWriteItr != mPendingWrites.end())
     {
-        mOffloadManager.getStream().wait(blockPendingWriteItr->second);
-        // Don't erase, we are not changing state of block
-    }
-    // Wait for any pending reads before overwriting offloadBlock
-    auto offloadBlockPendingReadItr = mPendingReads.find(offloadBlock->getMemoryPoolBlockIndex());
-    if (offloadBlockPendingReadItr != mPendingReads.end())
-    {
-        mOffloadManager.getStream().wait(offloadBlockPendingReadItr->second);
-        mPendingReads.erase(offloadBlockPendingReadItr);
-    }
-    // Wait for any pending writes before overwriting offloadBlock
-    auto offloadBlockPendingWriteItr = mPendingWrites.find(offloadBlock->getMemoryPoolBlockIndex());
-    if (offloadBlockPendingWriteItr != mPendingWrites.end())
-    {
-        mOffloadManager.getStream().wait(offloadBlockPendingWriteItr->second);
-        mPendingWrites.erase(offloadBlockPendingWriteItr);
+        std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+        // Wait for any pending writes before reading from block
+        auto blockPendingWriteItr = mPendingWrites.find(block->getMemoryPoolBlockIndex());
+        if (blockPendingWriteItr != mPendingWrites.end())
+        {
+            mOffloadManager.getStream().wait(blockPendingWriteItr->second);
+            // Don't erase, we are not changing state of block
+        }
+        // Wait for any pending reads before overwriting offloadBlock
+        auto offloadBlockPendingReadItr = mPendingReads.find(offloadBlock->getMemoryPoolBlockIndex());
+        if (offloadBlockPendingReadItr != mPendingReads.end())
+        {
+            mOffloadManager.getStream().wait(offloadBlockPendingReadItr->second);
+            mPendingReads.erase(offloadBlockPendingReadItr);
+        }
+        // Wait for any pending writes before overwriting offloadBlock
+        auto offloadBlockPendingWriteItr = mPendingWrites.find(offloadBlock->getMemoryPoolBlockIndex());
+        if (offloadBlockPendingWriteItr != mPendingWrites.end())
+        {
+            mOffloadManager.getStream().wait(offloadBlockPendingWriteItr->second);
+            mPendingWrites.erase(offloadBlockPendingWriteItr);
+        }
     }
 
     copyBlock(block, offloadBlock, pools, true, numTokensToCopy, mode, directory);
@@ -356,12 +365,15 @@ void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offl
         mOffloadByteCount += computeBlockTransferBytes(pools, numTokensToCopy);
     }
 
-    // Record new pending read from block
-    mPendingReads[block->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOffloadManager.getStream().record(mPendingReads[block->getMemoryPoolBlockIndex()]);
-    // Record new pending write to offloadBlock
-    mPendingWrites[offloadBlock->getMemoryPoolBlockIndex()] = tr::CudaEvent();
-    mOffloadManager.getStream().record(mPendingWrites[offloadBlock->getMemoryPoolBlockIndex()]);
+    {
+        std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+        // Record new pending read from block
+        mPendingReads[block->getMemoryPoolBlockIndex()] = tr::CudaEvent();
+        mOffloadManager.getStream().record(mPendingReads[block->getMemoryPoolBlockIndex()]);
+        // Record new pending write to offloadBlock
+        mPendingWrites[offloadBlock->getMemoryPoolBlockIndex()] = tr::CudaEvent();
+        mOffloadManager.getStream().record(mPendingWrites[offloadBlock->getMemoryPoolBlockIndex()]);
+    }
 }
 
 void KVCacheTransferManager::syncWithBufferManager()
@@ -375,8 +387,11 @@ void KVCacheTransferManager::syncWithBufferManager()
     mOnboardManager.getStream().wait(readyForOnboardEvent);
 
     // Once we synchronize, clear our list of pending thransfers.
-    mPendingReads.clear();
-    mPendingWrites.clear();
+    {
+        std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+        mPendingReads.clear();
+        mPendingWrites.clear();
+    }
 }
 
 void KVCacheTransferManager::syncTransfers()
@@ -390,12 +405,16 @@ void KVCacheTransferManager::syncTransfers()
     mBufferManager.getStream().wait(onboardEvent);
 
     // Once we synchronize, clear our list of pending thransfers.
-    mPendingReads.clear();
-    mPendingWrites.clear();
+    {
+        std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+        mPendingReads.clear();
+        mPendingWrites.clear();
+    }
 }
 
 void KVCacheTransferManager::waitForPendingWrite(kernels::KVCacheIndex::UnderlyingType slotIdx)
 {
+    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
     auto it = mPendingWrites.find(slotIdx);
     if (it == mPendingWrites.end())
     {
@@ -407,6 +426,22 @@ void KVCacheTransferManager::waitForPendingWrite(kernels::KVCacheIndex::Underlyi
     // and the pending-write tracking can be cleared.
     it->second.synchronize();
     mPendingWrites.erase(it);
+}
+
+bool KVCacheTransferManager::isPendingWriteComplete(kernels::KVCacheIndex::UnderlyingType slotIdx)
+{
+    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
+    auto it = mPendingWrites.find(slotIdx);
+    if (it == mPendingWrites.end())
+    {
+        return true;
+    }
+    if (!it->second.query())
+    {
+        return false;
+    }
+    mPendingWrites.erase(it);
+    return true;
 }
 
 KvCacheTransferStats KVCacheTransferManager::getAndResetTransferStats()

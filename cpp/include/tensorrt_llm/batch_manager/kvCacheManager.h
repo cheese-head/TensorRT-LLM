@@ -1153,7 +1153,9 @@ public:
     //!   2. swap-before-DMA-commit: after a primary->secondary offload, the lookup
     //!      tree's hash-to-slot pointer is updated immediately but the underlying DMA
     //!      copy is queued on the offload stream and may not be visible to a NIXL
-    //!      reader. Host-pinned hits wait on mPendingWrites[slot] before returning.
+    //!      reader. Host-pinned hits are returned only when the pending write has
+    //!      already completed; otherwise the temporary pin is released and the block
+    //!      is reported as an unpinned result so callers can retry or fall back.
     [[nodiscard]] std::vector<CacheLookupResult> findAndPinBlocksByHash(
         std::vector<size_t> const& blockHashes, CachePoolTier requestedTier, bool stopOnMiss);
 

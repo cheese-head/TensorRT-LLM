@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -64,6 +64,22 @@ public:
     void synchronize() const
     {
         TLLM_CUDA_CHECK(::cudaEventSynchronize(get()));
+    }
+
+    //! \brief Return whether the event has completed without blocking.
+    [[nodiscard]] bool query() const
+    {
+        auto const status = ::cudaEventQuery(get());
+        if (status == cudaSuccess)
+        {
+            return true;
+        }
+        if (status == cudaErrorNotReady)
+        {
+            return false;
+        }
+        TLLM_CUDA_CHECK(status);
+        return false;
     }
 
 private:

@@ -2188,18 +2188,24 @@ std::vector<CacheLookupResult> WindowBlockManager::findAndPinBlocksByHash(
         // lookup mutex so the returned slot cannot diverge from the held pin.
         auto const slotIdx = requestedTierBlock->getMemoryPoolBlockIndex();
 
-        if (requestedTier == CachePoolTier::kHostPinned)
+        if (requestedTier == CachePoolTier::kHostPinned && !mTransferManager->isPendingWriteComplete(slotIdx))
         {
-            // CPU-side wait for any in-flight offload DMA targeting this slot. The
-            // lookup-tree to secondary-slot pointer is committed at offload() time,
-            // but the actual primary to secondary copy is queued on the offload
-            // stream and not yet visible to a NIXL/RDMA reader.
-            // This currently runs while the API and lookup-tree mutexes are held,
-            // so a slow offload can stall scheduler admission. A future refinement
-            // can split the operation into find+pin+slot capture under the locks,
-            // then wait before returning descriptors once pending-write tracking is
-            // safe to query outside the KVCM API critical section.
-            mTransferManager->waitForPendingWrite(slotIdx);
+            // The block is visible in the lookup tree, but the offload DMA into
+            // this host slot has not committed yet. Do not block the source RPC
+            // thread here: release the temporary lookup pin and let callers retry
+            // or fall back rather than returning a descriptor for stale bytes.
+            requestedTierBlock->decRefCount();
+            if (!requestedTierBlock->hasRefs())
+            {
+                mEvictionPolicy->releaseBlock(requestedTierBlock);
+            }
+            results.push_back(CacheLookupResult{
+                blockHash, false, requestedTier, std::int32_t{-1}, SizeType32{-1}});
+            if (stopOnMiss)
+            {
+                break;
+            }
+            continue;
         }
 
         results.push_back(CacheLookupResult{
