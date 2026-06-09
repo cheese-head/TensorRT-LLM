@@ -20,6 +20,7 @@ import logging
 import os
 import pickle
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -117,8 +118,14 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
 
     def _loop() -> None:
         while True:
+            method = "<unparsed>"
+            request_start = time.monotonic()
             try:
                 raw = rep.recv()
+                request_start = time.monotonic()
+                logging.warning(
+                    "remote_g2: ZMQ REP received bytes=%d", len(raw)
+                )
             except Exception:
                 logging.exception("remote_g2: ZMQ REP recv failed; exiting loop")
                 return
@@ -126,12 +133,28 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
                 req = pickle.loads(raw)
                 method = req.get("method")
                 payload = req.get("payload") or {}
+                logging.warning("remote_g2: ZMQ REP handling method=%s", method)
                 if method == "resolve_and_lease":
+                    resolve_start = time.monotonic()
+                    logging.warning("remote_g2: resolve_and_lease begin")
                     result = registry.resolve_and_lease(payload.get("plan"))
+                    logging.warning(
+                        "remote_g2: resolve_and_lease end elapsed_ms=%.3f reason=%s descriptors=%d",
+                        (time.monotonic() - resolve_start) * 1000,
+                        result.reason,
+                        len(result.descriptors or ()),
+                    )
                     response = {"ok": True, "result": _result_to_dict(result)}
                 elif method == "release_lease":
+                    release_start = time.monotonic()
+                    logging.warning("remote_g2: release_lease begin")
                     completed = registry.release_lease(
                         payload["lease_id"], payload.get("reason", "ack")
+                    )
+                    logging.warning(
+                        "remote_g2: release_lease end elapsed_ms=%.3f completed=%s",
+                        (time.monotonic() - release_start) * 1000,
+                        completed,
                     )
                     response = {"ok": True, "result": completed}
                 elif method == "get_metadata":
@@ -190,8 +213,21 @@ def _start_zmq_rep_service(registry: SourceG2DescriptorRegistry, dynamo_pid: int
             except Exception as exc:
                 logging.exception("remote_g2: ZMQ REP handler raised")
                 response = {"ok": False, "error": repr(exc)}
+            logging.warning(
+                "remote_g2: ZMQ REP handler complete method=%s ok=%s elapsed_ms=%.3f",
+                method,
+                response.get("ok"),
+                (time.monotonic() - request_start) * 1000,
+            )
             try:
+                send_start = time.monotonic()
                 rep.send(pickle.dumps(response))
+                logging.warning(
+                    "remote_g2: ZMQ REP sent method=%s total_elapsed_ms=%.3f send_ms=%.3f",
+                    method,
+                    (time.monotonic() - request_start) * 1000,
+                    (time.monotonic() - send_start) * 1000,
+                )
             except Exception:
                 logging.exception("remote_g2: ZMQ REP send failed")
 
