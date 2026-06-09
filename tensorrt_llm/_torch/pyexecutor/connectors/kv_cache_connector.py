@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -88,6 +88,7 @@ class SchedulerOutput:
 class KvCacheConnectorWorker(ABC):
     requires_retryable_kv_admission = False
     requires_disable_overlap_scheduler = False
+    requires_disable_attention_dp = False
     requires_uniform_attention_window = False
 
     def __init__(self, llm_args: TorchLlmArgs):
@@ -190,6 +191,7 @@ class KvCacheConnectorWorker(ABC):
 class KvCacheConnectorScheduler(ABC):
     requires_retryable_kv_admission = False
     requires_disable_overlap_scheduler = False
+    requires_disable_attention_dp = False
     requires_uniform_attention_window = False
 
     def __init__(self, llm_args: TorchLlmArgs):
@@ -454,6 +456,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     @property
     def requires_disable_overlap_scheduler(self) -> bool:
         return self._connector_requires("requires_disable_overlap_scheduler")
+
+    @property
+    def requires_disable_attention_dp(self) -> bool:
+        return self._connector_requires("requires_disable_attention_dp")
 
     @property
     def requires_uniform_attention_window(self) -> bool:

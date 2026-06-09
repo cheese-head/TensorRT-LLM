@@ -431,3 +431,20 @@ def test_prepare_resources_and_refresh_queueability_keeps_admitted_batch_queueab
     assert can_queue_this_rank is True
     assert scheduled_batch.batch_size == 1
     executor.inflight_req_ids.erase.assert_not_called()
+
+
+def test_kv_connector_manager_rejects_attention_dp_when_required():
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = None
+    executor.dist = Mock()
+    executor.dist.pp_size = 1
+    executor.kv_cache_manager = Mock()
+    executor.disable_overlap_scheduler = False
+    executor.enable_attention_dp = True
+    executor.kv_connector_manager = Mock()
+    executor.kv_connector_manager.requires_disable_overlap_scheduler = False
+    executor.kv_connector_manager.requires_disable_attention_dp = True
+    executor.kv_connector_manager.requires_uniform_attention_window = False
+
+    with pytest.raises(NotImplementedError, match="enable_attention_dp=False"):
+        PyExecutor._maybe_init_kv_connector_manager(executor)

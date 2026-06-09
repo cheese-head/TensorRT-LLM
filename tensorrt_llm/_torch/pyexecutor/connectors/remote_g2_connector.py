@@ -134,6 +134,7 @@ def _resolve_release_lease(explicit: Optional[Callable[[str, str], bool]]):
 class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
     requires_retryable_kv_admission = True
     requires_disable_overlap_scheduler = False
+    requires_disable_attention_dp = True
     requires_uniform_attention_window = True
 
     def __init__(
@@ -261,6 +262,7 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
 class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
     requires_retryable_kv_admission = True
     requires_disable_overlap_scheduler = False
+    requires_disable_attention_dp = True
     requires_uniform_attention_window = True
 
     def __init__(

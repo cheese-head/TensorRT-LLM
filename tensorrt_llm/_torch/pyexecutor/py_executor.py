@@ -633,6 +633,12 @@ class PyExecutor:
                     "The selected KV Cache Connector requires disable_overlap_scheduler=True; "
                     "overlap scheduler retryable KV admission is not validated.")
 
+            if (self.kv_connector_manager.requires_disable_attention_dp
+                    and self.enable_attention_dp):
+                raise NotImplementedError(
+                    "The selected KV Cache Connector requires enable_attention_dp=False; "
+                    "attention-DP retryable KV admission is not validated.")
+
             if (self.kv_connector_manager.requires_uniform_attention_window
                     and (self.kv_cache_manager.is_vswa
                          or self.kv_cache_manager.is_linear_attention)):
