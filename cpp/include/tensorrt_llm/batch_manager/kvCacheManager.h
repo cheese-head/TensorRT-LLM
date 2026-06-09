@@ -2511,7 +2511,26 @@ public:
         std::vector<size_t> const& blockHashes, CachePoolTier requestedTier, bool stopOnMiss, SizeType32 windowSize)
         override
     {
-        std::lock_guard<std::mutex> lock(mApiMtx);
+        std::unique_lock<std::mutex> lock(mApiMtx, std::try_to_lock);
+        if (!lock.owns_lock())
+        {
+            TLLM_LOG_DEBUG(
+                "KVCacheManager::findAndPinBlocksByHash: API mutex is busy; returning retryable miss for %zu block "
+                "hash(es)",
+                blockHashes.size());
+            std::vector<CacheLookupResult> results;
+            results.reserve(stopOnMiss ? std::min<size_t>(blockHashes.size(), 1) : blockHashes.size());
+            for (auto const blockHash : blockHashes)
+            {
+                results.push_back(
+                    CacheLookupResult{blockHash, false, std::nullopt, std::int32_t{-1}, SizeType32{-1}});
+                if (stopOnMiss)
+                {
+                    break;
+                }
+            }
+            return results;
+        }
         return mBlockManager.findAndPinBlocksByHash(blockHashes, requestedTier, stopOnMiss, windowSize);
     }
 
