@@ -689,8 +689,11 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 std::string const& tier, bool stop_on_miss)
             {
                 auto const requestedTier = cachePoolTierFromString(tier);
-                auto results
-                    = self.findAndPinBlocksByHash(block_hashes, requestedTier, stop_on_miss, window_size);
+                std::vector<tbk::CacheLookupResult> results;
+                {
+                    nb::gil_scoped_release release;
+                    results = self.findAndPinBlocksByHash(block_hashes, requestedTier, stop_on_miss, window_size);
+                }
                 nb::list pyResults;
                 for (auto const& result : results)
                 {
