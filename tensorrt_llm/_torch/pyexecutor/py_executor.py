@@ -1972,6 +1972,19 @@ class PyExecutor:
         else:
             self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
 
+    def _prepare_resources_and_refresh_queueability(self, scheduled_batch):
+        skipped_context_requests = self.resource_manager.prepare_resources(
+            scheduled_batch) or []
+        for req in skipped_context_requests:
+            self.inflight_req_ids.erase(req.request_id)
+
+        can_queue, can_queue_this_rank = self._can_queue(scheduled_batch)
+        if skipped_context_requests and scheduled_batch.batch_size == 0:
+            logger.debug(
+                "Skipping forward because no scheduled requests were admitted this tick"
+            )
+        return can_queue, can_queue_this_rank
+
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
@@ -2264,15 +2277,8 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    skipped_context_requests = self.resource_manager.prepare_resources(
+                    can_queue, _ = self._prepare_resources_and_refresh_queueability(
                         scheduled_batch)
-                    if skipped_context_requests:
-                        for req in skipped_context_requests:
-                            self.inflight_req_ids.erase(req.request_id)
-                    if scheduled_batch.batch_size == 0:
-                        logger.debug(
-                            "Skipping forward because no scheduled requests were admitted this tick")
-                        can_queue = False
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -2529,7 +2535,8 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self.resource_manager.prepare_resources(scheduled_batch)
+                    can_queue, can_queue_this_rank = self._prepare_resources_and_refresh_queueability(
+                        scheduled_batch)
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()

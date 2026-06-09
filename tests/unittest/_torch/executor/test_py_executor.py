@@ -18,7 +18,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     RequestQueueItem,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, ScheduledRequests
 
 
 class MockPyExecutor:
@@ -383,3 +383,51 @@ class TestComputeScheduledTokens:
             context_chunk_size=50, context_remaining_length=50, estimated_reusable_tokens=10
         )
         assert PyExecutor._compute_scheduled_tokens([req0, req1], []) == 20 + 40
+
+
+def test_prepare_resources_and_refresh_queueability_releases_skipped_inflight_id():
+    executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = False
+    executor.inflight_req_ids = Mock()
+
+    skipped_request = Mock()
+    skipped_request.request_id = 123
+    skipped_request.is_last_context_chunk = True
+
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.append_context_request(skipped_request)
+
+    def prepare_resources(batch):
+        batch.reset_context_requests([])
+        return [skipped_request]
+
+    executor.resource_manager = Mock()
+    executor.resource_manager.prepare_resources.side_effect = prepare_resources
+
+    can_queue, can_queue_this_rank = PyExecutor._prepare_resources_and_refresh_queueability(
+        executor, scheduled_batch)
+
+    assert can_queue is False
+    assert can_queue_this_rank is False
+    assert scheduled_batch.batch_size == 0
+    executor.inflight_req_ids.erase.assert_called_once_with(123)
+
+
+def test_prepare_resources_and_refresh_queueability_keeps_admitted_batch_queueable():
+    executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = False
+    executor.inflight_req_ids = Mock()
+    executor.resource_manager = Mock()
+    executor.resource_manager.prepare_resources.return_value = []
+
+    generation_request = Mock()
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.append_generation_request(generation_request)
+
+    can_queue, can_queue_this_rank = PyExecutor._prepare_resources_and_refresh_queueability(
+        executor, scheduled_batch)
+
+    assert can_queue is True
+    assert can_queue_this_rank is True
+    assert scheduled_batch.batch_size == 1
+    executor.inflight_req_ids.erase.assert_not_called()
