@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/cudaEvent.h"
 
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 
@@ -78,23 +79,53 @@ public:
     //! \brief Get transfer stats accumulated since last call, and reset the counters.
     [[nodiscard]] KvCacheTransferStats getAndResetTransferStats();
 
-    //! \brief CPU-side block until any pending offload DMA write to the given memory-pool slot
-    //! has committed.
-    //! \details Offload DMAs are queued asynchronously on mOffloadManager's stream and the
-    //! corresponding tr::CudaEvent is stashed in mPendingWrites at offload() time. Code paths
-    //! that read the destination slot OUTSIDE of any CUDA stream — notably NIXL/RDMA-driven
-    //! cross-process reads of host-pinned secondary blocks — must ensure the write is complete
-    //! before reading, otherwise the network adapter can pull the slot's pre-offload contents.
-    //! No-op when there is no pending write for the slot. The pending-write entry is erased
-    //! on successful synchronization so subsequent callers do not pay the cost again.
-    void waitForPendingWrite(kernels::KVCacheIndex::UnderlyingType slotIdx);
+    //! \brief CPU-side block until any pending DMA write to the given memory-pool slot and tier has committed.
+    //! \details Transfer DMAs are queued asynchronously on internal streams and the corresponding tr::CudaEvent is
+    //! stashed in mPendingWrites. Code paths that read the destination slot
+    //! OUTSIDE of any CUDA stream - notably NIXL/RDMA-driven cross-process reads of host-pinned secondary blocks -
+    //! must ensure the write is complete before reading, otherwise the network adapter can pull the slot's
+    //! pre-offload contents. No-op when there is no pending write for the slot/tier. The pending-write entry is
+    //! erased on successful synchronization so subsequent callers do not pay the cost again.
+    void waitForPendingWrite(kernels::KVCacheIndex::UnderlyingType slotIdx, bool isPrimary);
 
-    //! \brief Return whether a pending offload write has completed without blocking.
-    //! \details Returns true when there is no pending write for the slot or when cudaEventQuery reports completion.
-    //!          The pending-write entry is erased only on completion. Returns false when the write is still in flight.
-    [[nodiscard]] bool isPendingWriteComplete(kernels::KVCacheIndex::UnderlyingType slotIdx);
+    //! \brief Return whether a pending write to the slot/tier has completed without blocking.
+    //! \details Returns true when there is no pending write for the slot/tier or when cudaEventQuery reports
+    //!          completion. The pending-write entry is erased only on completion. Returns false when the write is
+    //!          still in flight.
+    [[nodiscard]] bool isPendingWriteComplete(kernels::KVCacheIndex::UnderlyingType slotIdx, bool isPrimary);
 
 private:
+    struct PendingTransferKey
+    {
+        kernels::KVCacheIndex::UnderlyingType slotIdx;
+        bool isPrimary;
+
+        [[nodiscard]] bool operator==(PendingTransferKey const& other) const
+        {
+            return slotIdx == other.slotIdx && isPrimary == other.isPrimary;
+        }
+    };
+
+    struct PendingTransferKeyHash
+    {
+        [[nodiscard]] std::size_t operator()(PendingTransferKey const& key) const
+        {
+            auto const slotHash = std::hash<kernels::KVCacheIndex::UnderlyingType>{}(key.slotIdx);
+            auto const tierHash = std::hash<bool>{}(key.isPrimary);
+            return slotHash ^ (tierHash << 1);
+        }
+    };
+
+    static PendingTransferKey makePendingTransferKey(kernels::KVCacheIndex::UnderlyingType slotIdx, bool isPrimary)
+    {
+        return PendingTransferKey{slotIdx, isPrimary};
+    }
+
+    static PendingTransferKey makePendingTransferKey(BlockPtr const& block)
+    {
+        return makePendingTransferKey(block->getMemoryPoolBlockIndex(), block->isPrimary());
+    }
+
     //! \brief Get pointer to pool specified by cache block.
     static tr::ITensor::SharedPtr computeBlockPointer(
         BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools, size_t poolIdx);
@@ -126,11 +157,11 @@ private:
     runtime::BufferManager mOnboardManager;
     runtime::BufferManager mOffloadManager;
 
-    // Track reads and writes for blocks. Note that it is the memory pool index that
-    // identifies the raw memory blocks involved in I/O, not the block Id.
+    // Track reads and writes for raw memory slots, not block IDs. Primary and secondary pools can reuse the same
+    // numeric slot index, so the transfer key must include the pool tier.
     mutable std::mutex mPendingTransfersMutex;
-    std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingReads;
-    std::unordered_map<kernels::KVCacheIndex::UnderlyingType, tr::CudaEvent> mPendingWrites;
+    std::unordered_map<PendingTransferKey, tr::CudaEvent, PendingTransferKeyHash> mPendingReads;
+    std::unordered_map<PendingTransferKey, tr::CudaEvent, PendingTransferKeyHash> mPendingWrites;
     // Reference to parent loopback agent
     std::shared_ptr<kvc::BaseLoopbackAgent> mLoopbackAgent;
     int mDeviceId;

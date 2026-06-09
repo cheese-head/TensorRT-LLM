@@ -2188,7 +2188,8 @@ std::vector<CacheLookupResult> WindowBlockManager::findAndPinBlocksByHash(
         // lookup mutex so the returned slot cannot diverge from the held pin.
         auto const slotIdx = requestedTierBlock->getMemoryPoolBlockIndex();
 
-        if (requestedTier == CachePoolTier::kHostPinned && !mTransferManager->isPendingWriteComplete(slotIdx))
+        if (requestedTier == CachePoolTier::kHostPinned
+            && !mTransferManager->isPendingWriteComplete(slotIdx, /*isPrimary=*/false))
         {
             // The block is visible in the lookup tree, but the offload DMA into
             // this host slot has not committed yet. Do not block the source RPC
