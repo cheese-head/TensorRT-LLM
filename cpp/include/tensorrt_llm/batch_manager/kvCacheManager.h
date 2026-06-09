@@ -35,6 +35,7 @@
 #include <NvInferRuntime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -463,8 +464,9 @@ private:
     // Choice of pool is encoded into the type
     kernels::KVCacheIndex mMemoryPoolBlockIndex;
 
-    // Number of references to the block
-    SizeType32 mRefCount;
+    // Number of references to the block. Atomic because source RPC threads can pin/unpin blocks concurrently with
+    // scheduler-owned request references.
+    std::atomic<SizeType32> mRefCount;
 
     // Number of references to the block
     SizeType32 mSchedulingRefCount;
@@ -2511,26 +2513,6 @@ public:
         std::vector<size_t> const& blockHashes, CachePoolTier requestedTier, bool stopOnMiss, SizeType32 windowSize)
         override
     {
-        std::unique_lock<std::mutex> lock(mApiMtx, std::try_to_lock);
-        if (!lock.owns_lock())
-        {
-            TLLM_LOG_DEBUG(
-                "KVCacheManager::findAndPinBlocksByHash: API mutex is busy; returning retryable miss for %zu block "
-                "hash(es)",
-                blockHashes.size());
-            std::vector<CacheLookupResult> results;
-            results.reserve(stopOnMiss ? std::min<size_t>(blockHashes.size(), 1) : blockHashes.size());
-            for (auto const blockHash : blockHashes)
-            {
-                results.push_back(
-                    CacheLookupResult{blockHash, false, std::nullopt, std::int32_t{-1}, SizeType32{-1}});
-                if (stopOnMiss)
-                {
-                    break;
-                }
-            }
-            return results;
-        }
         return mBlockManager.findAndPinBlocksByHash(blockHashes, requestedTier, stopOnMiss, windowSize);
     }
 
@@ -2573,8 +2555,6 @@ private:
     std::unordered_map<LlmRequest::RequestIdType, GenerationRequest> mSequences;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
-    // Mutex to serialize scheduler admission with external KVCM pin/unpin APIs.
-    mutable std::mutex mApiMtx;
     // Mutex to protect access to mSequences
     mutable std::mutex mSequencesMtx;
     // buffers for static tensors, will be created after allocating pools

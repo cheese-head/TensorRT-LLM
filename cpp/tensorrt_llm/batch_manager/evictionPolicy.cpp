@@ -105,6 +105,7 @@ void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceho
 
 bool LRUEvictionPolicy::verifyQueueIntegrity() const
 {
+    std::lock_guard<std::mutex> lock(mMutex);
     static char const* const levelToStr[] = {"primary", "secondary", "placeholder"};
     static const std::function<bool(BlockPtr const&)> levelValidators[]
         = {[](BlockPtr const& block) { return block->isPrimary(); },
@@ -139,6 +140,7 @@ bool LRUEvictionPolicy::verifyQueueIntegrity() const
 
 std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
 {
+    std::lock_guard<std::mutex> lock(mMutex);
     SizeType32 const level = wantPlaceholder ? kPlaceholderLevel : cacheLevel;
 
     for (SizeType32 pri = 0; pri < kNumPriorities; pri++)
@@ -160,12 +162,45 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
     TLLM_THROW("No free block found. This shouldn't happen!");
 }
 
+std::optional<std::tuple<BlockPtr, bool>> LRUEvictionPolicy::tryClaimFreeBlock(
+    SizeType32 cacheLevel, bool wantPlaceholder)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    SizeType32 const level = wantPlaceholder ? kPlaceholderLevel : cacheLevel;
+
+    for (SizeType32 pri = 0; pri < kNumPriorities; pri++)
+    {
+        if (!mFreeQueues[level][pri].empty())
+        {
+            auto block = mFreeQueues[level][pri].front();
+            mFreeQueues[level][pri].pop_front();
+            mFreeBlockIterators[block->getBlockId()] = std::nullopt;
+            mNumFreeBlocksPerLevel[level]--;
+            mExpiringBlockHeap.erase(block);
+            bool const canOffload
+                = !wantPlaceholder && cacheLevel == 0 && pri >= getPriorityIdx(mSecondaryOffloadMinPriority);
+            return std::make_tuple(block, canOffload);
+        }
+    }
+    return std::nullopt;
+}
+
+std::tuple<BlockPtr, bool> LRUEvictionPolicy::claimFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
+{
+    auto claimed = tryClaimFreeBlock(cacheLevel, wantPlaceholder);
+    if (!claimed.has_value())
+    {
+        TLLM_THROW("No free block found. This shouldn't happen!");
+    }
+    return *claimed;
+}
+
 void LRUEvictionPolicy::releaseBlock(BlockPtr block)
 {
     releaseBlock(block, false);
 }
 
-void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
+void LRUEvictionPolicy::releaseBlockUnlocked(BlockPtr block, bool toFront)
 {
     // The dummy root block (kCachedBlocksRootId) is permanently attached to the lookup tree
     // via setAsRoot() and must never enter the eviction queue — it is not a real cache block.
@@ -205,8 +240,15 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     }
 }
 
+void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    releaseBlockUnlocked(block, toFront);
+}
+
 SizeType32 LRUEvictionPolicy::getNumFreeBlocks(SizeType32 cacheLevel)
 {
+    std::lock_guard<std::mutex> lock(mMutex);
     return mNumFreeBlocksPerLevel[cacheLevel];
 }
 
@@ -215,7 +257,7 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block)
     claimBlock(block, std::nullopt, std::nullopt);
 }
 
-void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+void LRUEvictionPolicy::claimBlockUnlocked(BlockPtr block, std::optional<executor::RetentionPriority> priority,
     std::optional<std::chrono::milliseconds> durationMs)
 {
     SizeType32 const id = block->getBlockId();
@@ -238,6 +280,13 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
     block->setDurationMs(durationMs);
 }
 
+void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+    std::optional<std::chrono::milliseconds> durationMs)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    claimBlockUnlocked(block, priority, durationMs);
+}
+
 std::chrono::steady_clock::time_point::duration LRUEvictionPolicy::getTime() const
 {
     return std::chrono::steady_clock::now().time_since_epoch();
@@ -245,6 +294,7 @@ std::chrono::steady_clock::time_point::duration LRUEvictionPolicy::getTime() con
 
 void LRUEvictionPolicy::refresh()
 {
+    std::lock_guard<std::mutex> lock(mMutex);
     while (!mExpiringBlockHeap.empty())
     {
         auto const block = *mExpiringBlockHeap.begin();

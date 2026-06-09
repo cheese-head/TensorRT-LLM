@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 
 #include <chrono>
+#include <mutex>
 #include <vector>
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
@@ -41,6 +42,14 @@ public:
     /// @returns The pointer to the free block, along with whether it can be offloaded
     /// @param wantPlaceholder If true, return a placeholder block instead of a normal block
     virtual std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) = 0;
+    /// @brief Select and remove a free block from the specified cache level if one is available.
+    /// @details This closes the race between a separate getFreeBlock() peek and claimBlock() removal when the
+    /// scheduler and remote-G2 source RPC thread access the free queues concurrently.
+    virtual std::optional<std::tuple<BlockPtr, bool>> tryClaimFreeBlock(
+        SizeType32 cacheLevel, bool wantPlaceholder = false)
+        = 0;
+    /// @brief Select and remove a free block from the specified cache level.
+    virtual std::tuple<BlockPtr, bool> claimFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) = 0;
     /// @brief Release a block. Prioritize the block for eviction if toFront=true
     virtual void releaseBlock(BlockPtr block) = 0;
     virtual void releaseBlock(BlockPtr block, bool toFront) = 0;
@@ -55,6 +64,15 @@ public:
     virtual void refresh() = 0;
 
     virtual bool verifyQueueIntegrity() const = 0;
+
+    /// @brief Mutex protecting eviction policy internals.
+    virtual std::mutex& getMutex() = 0;
+    /// @brief Claim a free block while getMutex() is already held.
+    virtual void claimBlockUnlocked(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+        std::optional<std::chrono::milliseconds> durationMs)
+        = 0;
+    /// @brief Release a block while getMutex() is already held.
+    virtual void releaseBlockUnlocked(BlockPtr block, bool toFront = false) = 0;
 };
 
 struct ExpiringBlockComparator
@@ -79,6 +97,9 @@ public:
     void initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById);
 
     std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
+    std::optional<std::tuple<BlockPtr, bool>> tryClaimFreeBlock(
+        SizeType32 cacheLevel, bool wantPlaceholder = false) override;
+    std::tuple<BlockPtr, bool> claimFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
 
     void releaseBlock(BlockPtr block) override;
     void releaseBlock(BlockPtr block, bool toFront) override;
@@ -97,6 +118,16 @@ public:
 
     bool verifyQueueIntegrity() const override;
 
+    std::mutex& getMutex() override
+    {
+        return mMutex;
+    }
+
+    void claimBlockUnlocked(BlockPtr block, std::optional<executor::RetentionPriority> priority,
+        std::optional<std::chrono::milliseconds> durationMs) override;
+
+    void releaseBlockUnlocked(BlockPtr block, bool toFront = false) override;
+
 private:
     /// @brief A fixed-size container supporting both non-negative and negative indexing.
     ///        Non-negative IDs index directly into positive.
@@ -114,6 +145,9 @@ private:
             return id >= 0 ? positive[id] : negative[-id];
         }
     };
+
+    // Serializes mutations of the free queues, iterator table, and expiration heap.
+    mutable std::mutex mMutex;
 
     // Queues of available leaf blocks, split by level and priority: [level][priorityIdx]
     // Levels 0,1 = primary,secondary (real cache); level 2 = placeholder
