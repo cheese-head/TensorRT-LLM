@@ -448,3 +448,26 @@ def test_kv_connector_manager_rejects_attention_dp_when_required():
 
     with pytest.raises(NotImplementedError, match="enable_attention_dp=False"):
         PyExecutor._maybe_init_kv_connector_manager(executor)
+
+
+@pytest.mark.parametrize("is_vswa,is_linear_attention", [(True, False),
+                                                         (False, True)])
+def test_kv_connector_manager_rejects_non_uniform_attention_window_when_required(
+        is_vswa, is_linear_attention):
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_transceiver = None
+    executor.dist = Mock()
+    executor.dist.pp_size = 1
+    executor.kv_cache_manager = Mock()
+    executor.kv_cache_manager.is_vswa = is_vswa
+    executor.kv_cache_manager.is_linear_attention = is_linear_attention
+    executor.disable_overlap_scheduler = True
+    executor.enable_attention_dp = False
+    executor.kv_connector_manager = Mock()
+    executor.kv_connector_manager.requires_disable_overlap_scheduler = False
+    executor.kv_connector_manager.requires_disable_attention_dp = False
+    executor.kv_connector_manager.requires_uniform_attention_window = True
+
+    with pytest.raises(NotImplementedError,
+                       match="single non-linear attention window"):
+        PyExecutor._maybe_init_kv_connector_manager(executor)

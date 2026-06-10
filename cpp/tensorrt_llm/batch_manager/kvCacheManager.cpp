@@ -3829,6 +3829,7 @@ bool KVCacheManager::tryAddSequenceBatch(
     auto const n = requestInfos.size();
 
     // --- Setup: create sequences, hold them (window-independent) ---
+    auto const& windowSizesMetadata = mBlockManager.getWindowSizesMetadata();
     std::vector<GenerationRequest*> sequences(n);
 
     for (size_t i = 0; i < n; ++i)
@@ -3845,7 +3846,7 @@ bool KVCacheManager::tryAddSequenceBatch(
         {
             auto lck = std::scoped_lock(mSequencesMtx);
             return mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
-                mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
+                windowSizesMetadata, kvCacheRetentionConfig);
         }();
         TLLM_CHECK(emplaceDone);
 
@@ -3867,8 +3868,20 @@ bool KVCacheManager::tryAddSequenceBatch(
         }
     };
 
+    std::unique_lock<std::recursive_mutex> singleWindowAdmissionLock;
+    if (windowSizesMetadata.size() == 1)
+    {
+        // Keep source-side findAndPinBlocksByHash from pinning a block after Phase 1
+        // has claimed it but before Phase 2 commits or rolls back the admission.
+        // Multi-window layouts keep the existing per-window locking; remote-G2 rejects
+        // those layouts before it can rely on retryable admission.
+        // This outer lock may nest eviction-policy locks in lower helpers; keep that
+        // order one-way (lookup tree before eviction policy).
+        singleWindowAdmissionLock = mBlockManager.lockLookupTree();
+    }
+
     // --- Phase 1: claim reusable blocks for all windows without publishing them to requests. ---
-    for (auto const& [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    for (auto const& [windowSize, metadata] : windowSizesMetadata)
     {
         // Use maxTokenNum (= max(windowSize, maxSequenceLength) + sinkBubbleLength) as the cap.
         // For SWA, blocks are allocated linearly for the full prompt; out-of-window blocks are
@@ -3910,7 +3923,7 @@ bool KVCacheManager::tryAddSequenceBatch(
     std::vector<SizeType32> totalMissedDelta(n, 0);
 
     // --- Phase 2: onboard and allocate all prepared windows. ---
-    for (auto const& [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    for (auto const& [windowSize, metadata] : windowSizesMetadata)
     {
         auto& claimResults = claimResultsByWindow.at(windowSize);
         auto const windowResults
@@ -3937,6 +3950,11 @@ bool KVCacheManager::tryAddSequenceBatch(
             totalReusedDelta[i] += stats.reusedDelta;
             totalMissedDelta[i] += stats.missedDelta;
         }
+    }
+
+    if (singleWindowAdmissionLock.owns_lock())
+    {
+        singleWindowAdmissionLock.unlock();
     }
 
     // --- Finalize: set prepopulated length and per-request stats ---

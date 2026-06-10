@@ -1426,6 +1426,15 @@ public:
 
     void allocatePools(bool useUvm);
 
+    //! \brief Lock the shared lookup tree for a compound block-ownership operation.
+    //! \details Lock ordering contract: when both the lookup-tree mutex and an eviction-policy
+    //!          mutex are needed, acquire the lookup-tree mutex first. Eviction-policy code must
+    //!          not call back into lookup-tree operations while holding its mutex.
+    [[nodiscard]] std::unique_lock<std::recursive_mutex> lockLookupTree()
+    {
+        return std::unique_lock<std::recursive_mutex>{mLookupTree.getMutex()};
+    }
+
     //! \brief Batch add sequences forwarding to WindowBlockManager::addSequenceBatch.
     [[nodiscard]] std::vector<WindowBlockManager::BatchSeqStats> addSequenceBatch(
         std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
