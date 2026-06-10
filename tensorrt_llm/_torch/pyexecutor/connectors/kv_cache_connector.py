@@ -676,6 +676,13 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         request), then returns the active requests whose allocated blocks
         overlap the failed set. The caller decides whether to recompute or
         terminate those requests.
+
+        Collective: the mpi_allgather is unconditional (it cannot be skipped
+        when this rank has no local failures, or it would mismatch ranks that
+        do). Failures are detected per-rank by each worker, so allgather -- not
+        a leader-only broadcast -- is the correct primitive: the union makes a
+        load failure on any rank visible everywhere. The caller MUST invoke
+        this symmetrically on every rank (see _kv_connector_handle_load_errors).
         """
         failed_block_ids = self.worker.get_block_ids_with_load_errors()
         all_failed = mpi_allgather(failed_block_ids)

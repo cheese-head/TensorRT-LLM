@@ -2183,6 +2183,13 @@ class PyExecutor:
         their computed prefix is rewound to the local (on-device) prefix so
         the engine recomputes the tokens the load was meant to fill. Requests
         for which the rewind cannot be applied are terminated with an error.
+
+        Collective contract: handle_load_errors() runs an mpi_allgather so a
+        load failure on any rank fails/recomputes the request on all ranks.
+        This method must therefore be called symmetrically on every rank, in
+        the same loop position as _kv_connector_terminate_requests() (which it
+        immediately follows), and never from inside a per-rank try/except where
+        one rank could skip the collective and deadlock the others.
         """
         if self.kv_connector_manager is None:
             return
@@ -2446,6 +2453,7 @@ class PyExecutor:
                     self._check_kv_transfer_timeout()
 
                 self._kv_connector_terminate_requests()
+                self._kv_connector_handle_load_errors()
 
                 if self.enable_iter_perf_stats and sample_state is not None:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -2740,6 +2748,7 @@ class PyExecutor:
                     self._check_kv_transfer_timeout()
 
                 self._kv_connector_terminate_requests()
+                self._kv_connector_handle_load_errors()
 
                 self.iter_counter += 1
 
@@ -3678,7 +3687,6 @@ class PyExecutor:
             torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
-            self._kv_connector_handle_load_errors()
 
             return outputs
         except Exception as e:

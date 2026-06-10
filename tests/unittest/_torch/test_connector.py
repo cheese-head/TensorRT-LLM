@@ -97,6 +97,62 @@ def test_connector_manager_get_finished_allgather(mpi_pool_executor):
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_connector_manager_handle_load_errors_allgather(mpi_pool_executor):
+    """handle_load_errors must allgather failed block ids across all ranks.
+
+    Regression test for the TP>1 deadlock: a load failure is detected per-rank,
+    so handle_load_errors runs an unconditional mpi_allgather. Every rank must
+    participate even when it has no local failure, and a failure reported on any
+    single rank must surface the affected request on *all* ranks. If a rank
+    skipped the collective when its own failed set was empty, this test would
+    hang (the other rank would block in allgather).
+    """
+
+    def test():
+        worker = MagicMock()
+
+        if mpi_rank() == 0:
+            scheduler = MagicMock()
+        else:
+            scheduler = None
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        # A single request occupying block 101 on every rank.
+        req = MagicMock()
+        req.request_id = 42
+        kv_cache_manager = MagicMock()
+        kv_cache_manager.get_cache_indices.return_value = [101]
+
+        # No failures anywhere: every rank still enters the allgather and the
+        # request is unaffected.
+        worker.get_block_ids_with_load_errors.return_value = []
+        assert manager.handle_load_errors([req], kv_cache_manager) == []
+
+        # Failure reported only on rank 0. The union must reach rank 1 too, so
+        # both ranks return the affected request (and neither hangs).
+        if mpi_rank() == 0:
+            worker.get_block_ids_with_load_errors.return_value = [101]
+        else:
+            worker.get_block_ids_with_load_errors.return_value = []
+        assert manager.handle_load_errors([req], kv_cache_manager) == [req]
+
+        # Symmetric case: failure reported only on the non-leader rank.
+        if mpi_rank() == 0:
+            worker.get_block_ids_with_load_errors.return_value = []
+        else:
+            worker.get_block_ids_with_load_errors.return_value = [101]
+        assert manager.handle_load_errors([req], kv_cache_manager) == [req]
+
+        # A failed block that no active request holds affects nobody.
+        worker.get_block_ids_with_load_errors.return_value = [999]
+        assert manager.handle_load_errors([req], kv_cache_manager) == []
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_connector_manager_num_matched_tokens(mpi_pool_executor):
 
     def test():
