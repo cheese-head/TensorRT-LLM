@@ -79,15 +79,6 @@ public:
     //! \brief Get transfer stats accumulated since last call, and reset the counters.
     [[nodiscard]] KvCacheTransferStats getAndResetTransferStats();
 
-    //! \brief CPU-side block until any pending DMA write to the given memory-pool slot and tier has committed.
-    //! \details Transfer DMAs are queued asynchronously on internal streams and the corresponding tr::CudaEvent is
-    //! stashed in mPendingWrites. Code paths that read the destination slot
-    //! OUTSIDE of any CUDA stream - notably NIXL/RDMA-driven cross-process reads of host-pinned secondary blocks -
-    //! must ensure the write is complete before reading, otherwise the network adapter can pull the slot's
-    //! pre-offload contents. No-op when there is no pending write for the slot/tier. The pending-write entry is
-    //! erased on successful synchronization so subsequent callers do not pay the cost again.
-    void waitForPendingWrite(kernels::KVCacheIndex::UnderlyingType slotIdx, bool isPrimary);
-
     //! \brief Return whether a pending write to the slot/tier has completed without blocking.
     //! \details Returns true when there is no pending write for the slot/tier or when cudaEventQuery reports
     //!          completion. The pending-write entry is erased only on completion. Returns false when the write is

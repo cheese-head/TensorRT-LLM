@@ -422,23 +422,6 @@ void KVCacheTransferManager::syncTransfers()
     }
 }
 
-void KVCacheTransferManager::waitForPendingWrite(kernels::KVCacheIndex::UnderlyingType slotIdx, bool isPrimary)
-{
-    auto const key = makePendingTransferKey(slotIdx, isPrimary);
-    std::lock_guard<std::mutex> lock(mPendingTransfersMutex);
-    auto it = mPendingWrites.find(key);
-    if (it == mPendingWrites.end())
-    {
-        return;
-    }
-    // CPU-side block via cudaEventSynchronize so callers that read this slot outside
-    // any CUDA stream (e.g. NIXL/RDMA) observe the offload DMA's bytes, not the slot's
-    // pre-offload contents. After synchronize() returns we know the write is committed
-    // and the pending-write tracking can be cleared.
-    it->second.synchronize();
-    mPendingWrites.erase(it);
-}
-
 bool KVCacheTransferManager::isPendingWriteComplete(kernels::KVCacheIndex::UnderlyingType slotIdx, bool isPrimary)
 {
     auto const key = makePendingTransferKey(slotIdx, isPrimary);
