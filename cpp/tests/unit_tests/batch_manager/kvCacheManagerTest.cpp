@@ -4694,10 +4694,10 @@ TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
     EXPECT_EQ(freeAfterUnpin, totalBlocks);
 }
 
-// Verifies the symmetric pinBlocksById(blockIds) API: pinning a free-queue
-// block must claim it out of the queue before incRef, an unpin returns it,
-// and N pins compose via refcount (only the Nth unpin releases).
-TEST_F(KVCacheManagerTest, PinBlocksByIdAndRefcountComposition)
+// Verifies that pinBlocksById is intentionally fail-closed. By-id pinning can
+// bypass the radix-tree visibility guard after scheduler detach, so the API
+// currently returns no locations and leaves block ownership unchanged.
+TEST_F(KVCacheManagerTest, PinBlocksByIdDisabledReturnsNoLocations)
 {
     using namespace tensorrt_llm::batch_manager::kv_cache_manager;
     auto constexpr numLayers = 2;
@@ -4724,9 +4724,6 @@ TEST_F(KVCacheManagerTest, PinBlocksByIdAndRefcountComposition)
     bool constexpr isStreaming{false};
     auto llmRequest = std::make_shared<LlmRequest>(requestId, 0, inputTokens, samplingConfig, isStreaming);
 
-    // Admit a sequence and store its context blocks so they end up tree-attached
-    // with refcount 0 after the sequence is removed — exactly the state our
-    // lease handler will encounter when a peer requests a previously-stored hash.
     kvCacheManager.addSequenceBatch(
         {{{requestId, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
     auto const allBlockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
@@ -4738,45 +4735,11 @@ TEST_F(KVCacheManagerTest, PinBlocksByIdAndRefcountComposition)
     (void) kvCacheManager.removeSequence(requestId, llmRequest);
 
     auto const totalBlocks = kvCacheManager.getMaxNumBlocks();
-    auto const freeAfterRemove = kvCacheManager.getNumFreeBlocks();
-    EXPECT_EQ(freeAfterRemove, totalBlocks);
+    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), totalBlocks);
 
-    // pinBlocksById from the free queue: the block must be claimed out of the
-    // queue and have its refcount incremented. Free count drops by exactly
-    // the number of blocks pinned. The returned (slot, level) pairs reflect
-    // the authoritative post-pin physical location of each block.
     auto locations = kvCacheManager.pinBlocksById(blockIds);
-    auto const freeAfterPin = kvCacheManager.getNumFreeBlocks();
-    EXPECT_EQ(freeAfterPin, totalBlocks - static_cast<SizeType32>(blockIds.size()));
 
-    // Returned locations: one entry per input block_id; primary slot in range,
-    // level == 0 (admission lands on primary).
-    ASSERT_EQ(locations.size(), blockIds.size());
-    for (auto const& [slotIdx, cacheLevel] : locations)
-    {
-        EXPECT_EQ(cacheLevel, 0);
-        EXPECT_GE(slotIdx, 0);
-        EXPECT_LT(slotIdx, blocksInPrimaryPool);
-    }
-
-    // Symmetric unpin returns every block to the free queue.
-    kvCacheManager.unpinBlocksById(blockIds);
-    auto const freeAfterUnpin = kvCacheManager.getNumFreeBlocks();
-    EXPECT_EQ(freeAfterUnpin, totalBlocks);
-
-    // Refcount composition: two pins on the same blocks require two unpins
-    // before they return to the free queue. Both pin calls return locations
-    // that match — pinning an already-pinned block does not move it.
-    auto firstPin = kvCacheManager.pinBlocksById(blockIds);
-    auto secondPin = kvCacheManager.pinBlocksById(blockIds);
-    EXPECT_EQ(firstPin, secondPin);
-    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), totalBlocks - static_cast<SizeType32>(blockIds.size()));
-
-    kvCacheManager.unpinBlocksById(blockIds);
-    // One unpin removed — the blocks are still pinned (refcount 1 each).
-    EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), totalBlocks - static_cast<SizeType32>(blockIds.size()));
-
-    kvCacheManager.unpinBlocksById(blockIds);
+    EXPECT_TRUE(locations.empty());
     EXPECT_EQ(kvCacheManager.getNumFreeBlocks(), totalBlocks);
 }
 

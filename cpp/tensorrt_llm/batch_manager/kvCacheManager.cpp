@@ -3087,56 +3087,10 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
 std::vector<std::pair<SizeType32, SizeType32>> WindowBlockManager::pinBlocksById(
     std::vector<KVCacheBlock::IdType> const& blockIds)
 {
-    std::vector<std::pair<SizeType32, SizeType32>> locations;
-    locations.reserve(blockIds.size());
-    if (blockIds.empty())
-    {
-        return locations;
-    }
-
-    static constexpr SizeType32 kPrimaryLevel = 0;
-    static constexpr SizeType32 kSecondaryLevel = 1;
-
-    for (auto const& blockId : blockIds)
-    {
-        TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
-            "Block id %d is out of range", blockId);
-        auto block = mAllBlocksById[blockId];
-        if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
-        {
-            SizeType32 slotIdx;
-            SizeType32 cacheLevel;
-            {
-                std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
-                if (!block->hasRefs())
-                {
-                    mEvictionPolicy->claimBlockUnlocked(block, block->getPriority(), block->getDurationMs());
-                }
-                block->incRefCount();
-                // Capture the post-pin (slot, level) atomically with the pin so callers cannot observe a slot that
-                // diverges from the held pin.
-                slotIdx = block->getMemoryPoolBlockIndex();
-                cacheLevel = block->isPrimary() ? kPrimaryLevel : kSecondaryLevel;
-            }
-            if (cacheLevel == kSecondaryLevel && !mTransferManager->isPendingWriteComplete(slotIdx, /*isPrimary=*/false))
-            {
-                std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
-                block->decRefCount();
-                if (!block->hasRefs())
-                {
-                    mEvictionPolicy->releaseBlockUnlocked(block);
-                }
-                locations.emplace_back(-1, -1);
-                continue;
-            }
-            locations.emplace_back(slotIdx, cacheLevel);
-        }
-        else
-        {
-            locations.emplace_back(-1, -1);
-        }
-    }
-    return locations;
+    (void) blockIds;
+    // Disabled: by-id pinning can bypass radix-tree visibility and pin a block after the scheduler has detached it
+    // for reuse. Use findAndPinBlocksByHash for cache lookups so lookup, pin, and pending-write checks stay atomic.
+    return {};
 }
 
 // Only in TRT path

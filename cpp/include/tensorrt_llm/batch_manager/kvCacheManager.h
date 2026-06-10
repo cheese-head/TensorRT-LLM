@@ -1164,17 +1164,12 @@ public:
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
-    //! \brief Pin blocks by block ids directly. For each id, if the block is
-    //! currently in the eviction policy's free queue (refcount 0), claim it
-    //! out of the queue before incrementing the refcount, so the unpin path
-    //! does not create a duplicate queue entry. Multiple pins on the same
-    //! block compose via refcount: only the matching count of unpins returns
-    //! the block to the free queue.
-    //!
-    //! Returns a vector of (slot_idx, cache_level) pairs in the same order
-    //! as the input blockIds, captured after the pin succeeds. This lets
-    //! callers obtain the authoritative post-pin physical location without
-    //! a separate query that could race with an in-flight offload/onboard.
+    //! \brief Pinning by block id is intentionally disabled for now.
+    //! \details Block ids address KVCacheBlock metadata directly and can bypass
+    //! the radix-tree visibility guard used by findAndPinBlocksByHash. A detached
+    //! block must not be pinned by id after the scheduler has claimed it for reuse.
+    //! This method returns no locations until all callers can prove their block ids
+    //! are lease-scoped and cannot refer to detached or repurposed blocks.
     std::vector<std::pair<SizeType32, SizeType32>> pinBlocksById(
         std::vector<KVCacheBlock::IdType> const& blockIds);
 

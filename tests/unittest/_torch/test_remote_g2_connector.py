@@ -536,6 +536,16 @@ def test_remote_g2_worker_observability_never_logs_raw_descriptors():
         assert not any(value in detail_text for value in forbidden)
 
 
+# Remote-G2 depends on retryable KV admission in KVCM V1, which is not validated
+# with the overlap scheduler because local offload/onboard can interleave with forward.
+def test_remote_g2_requires_overlap_scheduler_disabled():
+    scheduler_cls = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorScheduler
+    worker_cls = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker
+
+    assert scheduler_cls.requires_disable_overlap_scheduler
+    assert worker_cls.requires_disable_overlap_scheduler
+
+
 # Startup check: kv_cache_config.enable_partial_reuse must be False when the
 # remote-G2 connector is constructed. Partial reuse silently stops remote-G2
 # fetch from triggering, so misconfiguration must fail fast.
