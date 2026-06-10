@@ -254,7 +254,7 @@ void KVCacheBlock::swapMemoryPoolBlockOffset(std::shared_ptr<KVCacheBlock> other
 
 void KVCacheBlock::incRefCount()
 {
-    mRefCount++;
+    mRefCount.fetch_add(1);
 }
 
 void KVCacheBlock::decRefCount()
@@ -272,7 +272,7 @@ void KVCacheBlock::decSchedulingRefCount()
 
 bool KVCacheBlock::hasRefs() const
 {
-    return mRefCount > 0;
+    return mRefCount.load() > 0;
 }
 
 bool KVCacheBlock::isShared() const
@@ -281,7 +281,7 @@ bool KVCacheBlock::isShared() const
     // lookup tree (i.e., it is cached for reuse by future requests).
     // Note: mCachedBlocksRoot also has mLookupNode set (via setAsRoot), but it is never
     // placed in the eviction queue — enforced by an assertion in LRUEvictionPolicy::releaseBlock.
-    return mRefCount > 1 || mLookupNode != nullptr;
+    return mRefCount.load() > 1 || mLookupNode != nullptr;
 }
 
 bool KVCacheBlock::hasSchedulingRefs() const
