@@ -3877,6 +3877,11 @@ bool KVCacheManager::tryAddSequenceBatch(
         // those layouts before it can rely on retryable admission.
         // This outer lock may nest eviction-policy locks in lower helpers; keep that
         // order one-way (lookup tree before eviction policy).
+        // This scope is intentionally conservative: onboarding is still performed
+        // under the lookup-tree lock so a source RPC cannot lease a secondary block
+        // while scheduler admission is moving it into the request. A future refactor
+        // could mark claimed blocks as transitioning under this lock, release it while
+        // enqueueing the copy, then reacquire it to commit metadata.
         singleWindowAdmissionLock = mBlockManager.lockLookupTree();
     }
 
