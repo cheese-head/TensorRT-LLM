@@ -1169,9 +1169,9 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     // free-queue claim through radix-tree detach so source lookup cannot pin claimed-but-not-yet-detached blocks.
     std::lock_guard<std::recursive_mutex> allocationTreeLock(mLookupTree->getMutex());
 
-    // Atomically claim the primary/placeholder block so concurrent source RPC pins cannot observe it as free between a
+    // Atomically pop the primary/placeholder block so concurrent source RPC pins cannot observe it as free between a
     // separate peek and removal.
-    auto [block, canOffload] = mEvictionPolicy->claimFreeBlock(kPrimaryLevel, wantPlaceholder);
+    auto [block, canOffload] = mEvictionPolicy->popFreeBlock(kPrimaryLevel, wantPlaceholder);
     if (block->getUniqueTokens().empty())
     {
         ++mAllocNewBlocks;
@@ -1184,10 +1184,10 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     if (!wantPlaceholder && !block->getUniqueTokens().empty() && canOffload)
     {
         // Source lookup also holds the lookup-tree mutex before pinning by hash. Holding it here prevents the source
-        // RPC thread from pinning the secondary victim after it has been claimed for reuse but before it is detached
+        // RPC thread from pinning the secondary victim after it has been popped for reuse but before it is detached
         // from the radix tree.
         std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
-        auto offloadClaim = mEvictionPolicy->tryClaimFreeBlock(kSecondaryLevel);
+        auto offloadClaim = mEvictionPolicy->tryPopFreeBlock(kSecondaryLevel);
         if (offloadClaim.has_value())
         {
             // Offload block in primary memory before repurposing.
@@ -1213,7 +1213,7 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
             }
             // Release block (now secondary after swap) into secondary block queue, preserving its existing priority.
             mEvictionPolicy->releaseBlock(block);
-            // offloadBlock (now primary after swap) is already claimed. The final claimBlock() below will be a no-op
+            // offloadBlock (now primary after swap) is already popped. The final claimBlock() below will be a no-op
             // for the queue but still applies the caller's priority/durationMs.
             block = offloadBlock;
         }
@@ -1236,7 +1236,8 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         }
         block->detachFromLookupNode();
     }
-    // The block has already been removed from its free queue by claimFreeBlock(); this updates retention metadata.
+    // The selected block has already been popped from an eviction free queue; this applies the new
+    // request's retention metadata.
     mEvictionPolicy->claimBlock(block, priority, durationMs);
     TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d is now acquired by sequence %d", mLogPrefix.c_str(),
         block->getBlockId(), sequence.getRequestId());
@@ -1349,7 +1350,7 @@ void WindowBlockManager::offloadBlock(
     if (!block->isPlaceholder() && block->isPrimary())
     {
         std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
-        auto offloadClaim = mEvictionPolicy->tryClaimFreeBlock(kSecondaryLevel);
+        auto offloadClaim = mEvictionPolicy->tryPopFreeBlock(kSecondaryLevel);
         if (!offloadClaim.has_value())
         {
             return;

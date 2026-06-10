@@ -162,7 +162,7 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
     TLLM_THROW("No free block found. This shouldn't happen!");
 }
 
-std::optional<std::tuple<BlockPtr, bool>> LRUEvictionPolicy::tryClaimFreeBlock(
+std::optional<std::tuple<BlockPtr, bool>> LRUEvictionPolicy::tryPopFreeBlock(
     SizeType32 cacheLevel, bool wantPlaceholder)
 {
     std::lock_guard<std::mutex> lock(mMutex);
@@ -185,9 +185,9 @@ std::optional<std::tuple<BlockPtr, bool>> LRUEvictionPolicy::tryClaimFreeBlock(
     return std::nullopt;
 }
 
-std::tuple<BlockPtr, bool> LRUEvictionPolicy::claimFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
+std::tuple<BlockPtr, bool> LRUEvictionPolicy::popFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder)
 {
-    auto claimed = tryClaimFreeBlock(cacheLevel, wantPlaceholder);
+    auto claimed = tryPopFreeBlock(cacheLevel, wantPlaceholder);
     if (!claimed.has_value())
     {
         TLLM_THROW("No free block found. This shouldn't happen!");

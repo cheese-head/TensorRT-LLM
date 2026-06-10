@@ -45,11 +45,11 @@ public:
     /// @brief Select and remove a free block from the specified cache level if one is available.
     /// @details This closes the race between a separate getFreeBlock() peek and claimBlock() removal when the
     /// scheduler and remote-G2 source RPC thread access the free queues concurrently.
-    virtual std::optional<std::tuple<BlockPtr, bool>> tryClaimFreeBlock(
+    virtual std::optional<std::tuple<BlockPtr, bool>> tryPopFreeBlock(
         SizeType32 cacheLevel, bool wantPlaceholder = false)
         = 0;
     /// @brief Select and remove a free block from the specified cache level.
-    virtual std::tuple<BlockPtr, bool> claimFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) = 0;
+    virtual std::tuple<BlockPtr, bool> popFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) = 0;
     /// @brief Release a block. Prioritize the block for eviction if toFront=true
     virtual void releaseBlock(BlockPtr block) = 0;
     virtual void releaseBlock(BlockPtr block, bool toFront) = 0;
@@ -97,9 +97,9 @@ public:
     void initializePlaceholders(std::vector<BlockPtr>& allPlaceholderBlocksById);
 
     std::tuple<BlockPtr, bool> getFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
-    std::optional<std::tuple<BlockPtr, bool>> tryClaimFreeBlock(
+    std::optional<std::tuple<BlockPtr, bool>> tryPopFreeBlock(
         SizeType32 cacheLevel, bool wantPlaceholder = false) override;
-    std::tuple<BlockPtr, bool> claimFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
+    std::tuple<BlockPtr, bool> popFreeBlock(SizeType32 cacheLevel, bool wantPlaceholder = false) override;
 
     void releaseBlock(BlockPtr block) override;
     void releaseBlock(BlockPtr block, bool toFront) override;
