@@ -35,10 +35,6 @@ _CACHE_TIER_PRIMARY = "primary"
 _CACHE_TIER_HOST_PINNED = "host_pinned"
 
 
-def _remote_g2_rpc_trace_enabled() -> bool:
-    return os.environ.get("DYN_REMOTE_G2_RPC_TRACE", "0") == "1"
-
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -1135,14 +1131,6 @@ class SourceG2DescriptorRegistry:
         if self._window_size is None or self._block_size_bytes <= 0:
             return [CacheMiss(int(block_hashes[0]))] if block_hashes else []
         lookup_hashes = [int(block_hash) for block_hash in block_hashes]
-        trace_rpc = _remote_g2_rpc_trace_enabled()
-        lookup_start = time.monotonic()
-        if trace_rpc:
-            logging.warning(
-                "remote_g2: find_and_pin begin n=%d first_hash=%s",
-                len(lookup_hashes),
-                lookup_hashes[0] if lookup_hashes else None,
-            )
         try:
             raw_results = self._kv.find_and_pin_blocks_by_hash(
                 lookup_hashes,
@@ -1151,19 +1139,8 @@ class SourceG2DescriptorRegistry:
                 stop_on_miss=True,
             )
         except Exception:
-            logging.exception(
-                "remote_g2: find_and_pin raised n=%d elapsed_ms=%.3f",
-                len(lookup_hashes),
-                (time.monotonic() - lookup_start) * 1000,
-            )
+            logging.exception("remote_g2: find_and_pin raised n=%d", len(lookup_hashes))
             return [CacheMiss(int(block_hashes[0]))] if block_hashes else []
-        if trace_rpc:
-            logging.warning(
-                "remote_g2: find_and_pin end n=%d results=%d elapsed_ms=%.3f",
-                len(lookup_hashes),
-                len(raw_results),
-                (time.monotonic() - lookup_start) * 1000,
-            )
 
         results: list[CacheLookupResult] = []
         for raw in raw_results:

@@ -1978,7 +1978,7 @@ class PyExecutor:
         else:
             self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
 
-    def _prepare_resources_and_refresh_queueability(self, scheduled_batch):
+    def _prepare_resources_and_check_forward_ready(self, scheduled_batch):
         skipped_context_requests = self.resource_manager.prepare_resources(
             scheduled_batch) or []
         for req in skipped_context_requests:
@@ -2283,7 +2283,7 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    can_queue, _ = self._prepare_resources_and_refresh_queueability(
+                    can_queue, _ = self._prepare_resources_and_check_forward_ready(
                         scheduled_batch)
 
                 if self.kv_connector_manager:
@@ -2541,7 +2541,7 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    can_queue, can_queue_this_rank = self._prepare_resources_and_refresh_queueability(
+                    can_queue, can_queue_this_rank = self._prepare_resources_and_check_forward_ready(
                         scheduled_batch)
 
                 if self.kv_connector_manager:

@@ -385,7 +385,7 @@ class TestComputeScheduledTokens:
         assert PyExecutor._compute_scheduled_tokens([req0, req1], []) == 20 + 40
 
 
-def test_prepare_resources_and_refresh_queueability_releases_skipped_inflight_id():
+def test_prepare_resources_and_check_forward_ready_releases_skipped_inflight_id():
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = False
     executor.inflight_req_ids = Mock()
@@ -404,7 +404,7 @@ def test_prepare_resources_and_refresh_queueability_releases_skipped_inflight_id
     executor.resource_manager = Mock()
     executor.resource_manager.prepare_resources.side_effect = prepare_resources
 
-    can_queue, can_queue_this_rank = PyExecutor._prepare_resources_and_refresh_queueability(
+    can_queue, can_queue_this_rank = PyExecutor._prepare_resources_and_check_forward_ready(
         executor, scheduled_batch)
 
     assert can_queue is False
@@ -413,7 +413,7 @@ def test_prepare_resources_and_refresh_queueability_releases_skipped_inflight_id
     executor.inflight_req_ids.erase.assert_called_once_with(123)
 
 
-def test_prepare_resources_and_refresh_queueability_keeps_admitted_batch_queueable():
+def test_prepare_resources_and_check_forward_ready_keeps_admitted_batch_forward_ready():
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = False
     executor.inflight_req_ids = Mock()
@@ -424,7 +424,7 @@ def test_prepare_resources_and_refresh_queueability_keeps_admitted_batch_queueab
     scheduled_batch = ScheduledRequests()
     scheduled_batch.append_generation_request(generation_request)
 
-    can_queue, can_queue_this_rank = PyExecutor._prepare_resources_and_refresh_queueability(
+    can_queue, can_queue_this_rank = PyExecutor._prepare_resources_and_check_forward_ready(
         executor, scheduled_batch)
 
     assert can_queue is True
@@ -433,18 +433,27 @@ def test_prepare_resources_and_refresh_queueability_keeps_admitted_batch_queueab
     executor.inflight_req_ids.erase.assert_not_called()
 
 
-def test_kv_connector_manager_rejects_attention_dp_when_required():
+def _make_executor_for_kv_connector_init():
     executor = object.__new__(PyExecutor)
     executor.kv_cache_transceiver = None
     executor.dist = Mock()
     executor.dist.pp_size = 1
     executor.kv_cache_manager = Mock()
-    executor.disable_overlap_scheduler = False
-    executor.enable_attention_dp = True
+    executor.kv_cache_manager.is_vswa = False
+    executor.kv_cache_manager.is_linear_attention = False
+    executor.disable_overlap_scheduler = True
+    executor.enable_attention_dp = False
     executor.kv_connector_manager = Mock()
     executor.kv_connector_manager.requires_disable_overlap_scheduler = False
-    executor.kv_connector_manager.requires_disable_attention_dp = True
+    executor.kv_connector_manager.requires_disable_attention_dp = False
     executor.kv_connector_manager.requires_uniform_attention_window = False
+    return executor
+
+
+def test_kv_connector_manager_rejects_attention_dp_when_required():
+    executor = _make_executor_for_kv_connector_init()
+    executor.enable_attention_dp = True
+    executor.kv_connector_manager.requires_disable_attention_dp = True
 
     with pytest.raises(NotImplementedError, match="enable_attention_dp=False"):
         PyExecutor._maybe_init_kv_connector_manager(executor)
@@ -454,18 +463,9 @@ def test_kv_connector_manager_rejects_attention_dp_when_required():
                                                          (False, True)])
 def test_kv_connector_manager_rejects_non_uniform_attention_window_when_required(
         is_vswa, is_linear_attention):
-    executor = object.__new__(PyExecutor)
-    executor.kv_cache_transceiver = None
-    executor.dist = Mock()
-    executor.dist.pp_size = 1
-    executor.kv_cache_manager = Mock()
+    executor = _make_executor_for_kv_connector_init()
     executor.kv_cache_manager.is_vswa = is_vswa
     executor.kv_cache_manager.is_linear_attention = is_linear_attention
-    executor.disable_overlap_scheduler = True
-    executor.enable_attention_dp = False
-    executor.kv_connector_manager = Mock()
-    executor.kv_connector_manager.requires_disable_overlap_scheduler = False
-    executor.kv_connector_manager.requires_disable_attention_dp = False
     executor.kv_connector_manager.requires_uniform_attention_window = True
 
     with pytest.raises(NotImplementedError,

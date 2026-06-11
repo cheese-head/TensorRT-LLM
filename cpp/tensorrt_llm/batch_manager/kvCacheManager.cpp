@@ -1302,6 +1302,9 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
     {
         {
             std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+            // Defensive check: the retryable path handles pinned secondary claims before Phase 2, and the
+            // single-window path holds the lookup-tree lock across admission. Reaching this means that
+            // invariant changed.
             TLLM_CHECK_WITH_INFO(!offloadBlock->hasRefs(),
                 "Cannot onboard secondary block %d while it is pinned by another API user",
                 static_cast<int>(offloadBlock->getBlockId()));
@@ -1312,6 +1315,8 @@ void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr cons
         mTransferManager->onboard(offloadBlock, block, mPools, 0, mode, directory);
         {
             std::lock_guard<std::mutex> lruLock(mEvictionPolicy->getMutex());
+            // Defensive check before committing the metadata swap. Turning this into a retry path would need
+            // explicit rollback for the allocated primary block and any queued transfer work.
             TLLM_CHECK_WITH_INFO(!offloadBlock->hasRefs(),
                 "Cannot finish onboarding secondary block %d after it was pinned by another API user",
                 static_cast<int>(offloadBlock->getBlockId()));
