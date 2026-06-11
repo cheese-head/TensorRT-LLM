@@ -20,6 +20,7 @@ from .remote_g2 import (
     TargetRemotePlanStore,
     target_remote_g2_plan_store,
 )
+from .remote_g2_group import LoadStatus, RankScope
 from .remote_g2_observability import (
     NullRemoteG2ObservabilitySink,
     RemoteG2LifecycleEvent,
@@ -256,6 +257,16 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         self._active_loads: dict[int | str, _RemoteG2ActiveLoad] = {}
         self._completed_loads: set[int | str] = set()
         self._released_leases: set[str] = set()
+        # TP rank group. Under TP>1 every rank issues its own NIXL transfer for
+        # a request; get_finished uses this to make failure a group decision so
+        # a transfer error on any rank tears the load down on all ranks.
+        self._scope = RankScope.detect(llm_args)
+        # Requests that may still need group reconciliation. Seeded from the
+        # scheduler's started_loading_req_ids and trimmed only by the group
+        # collective's output, so it is identical on every rank — that lets
+        # get_finished gate (skip) the collective on idle steps without risking
+        # a one-sided skip that would deadlock MPI. See get_finished step 2.
+        self._coord_pending: set[int | str] = set()
         # Target-pool block ids of loads that failed since the last drain.
         # Surfaced to the executor via get_block_ids_with_load_errors() so it
         # can fall back to local recompute instead of waiting for the timeout.
@@ -328,55 +339,104 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
     def get_finished(
         self, finished_gen_req_ids: list[int], started_loading_req_ids: list[int]
     ) -> tuple[list[int], list[int]]:
-        finished_loading: list[int] = []
         # Iterate self._active_loads (all in-flight transfers), not just
-        # started_loading_req_ids (NEW this tick). The connector
-        # framework's get_finished moves the request from
-        # new_async_requests to pending_async_requests on the first
-        # tick, so subsequent ticks call us with empty
-        # started_loading_req_ids — without this iteration we'd only
-        # ever poll each transfer ONCE, and slow/in-progress transfers
+        # started_loading_req_ids (NEW this tick). The connector framework's
+        # get_finished moves the request from new_async_requests to
+        # pending_async_requests on the first tick, so subsequent ticks call
+        # us with empty started_loading_req_ids — without this iteration we'd
+        # only ever poll each transfer ONCE, and slow/in-progress transfers
         # would never get reported as finished.
+        #
+        # Step 1: poll every local transfer. A raised exception, an explicit
+        # NIXL failed state, or a timeout are all treated as a failure. We do
+        # NOT raise into the executor loop — a single failed transfer must not
+        # take down the engine.
+        local_done: list[int | str] = []
+        local_failed: dict[int | str, str] = {}
         for request_id in list(self._active_loads.keys()):
             active = self._active_loads.get(request_id)
             if active is None:
                 continue
+            status, reason = self._poll_status(active)
+            if status is LoadStatus.DONE:
+                local_done.append(request_id)
+            elif status is LoadStatus.FAILED:
+                local_failed[request_id] = reason or "transfer_failed"
+
+        # Step 2: make failure a group decision. Under TP>1 each rank runs its
+        # own transfer for the same request; a failure on ANY rank must fail
+        # the request on ALL ranks, otherwise the framework's all-ranks
+        # completion intersection would hang (the failed rank never reports the
+        # request finished) while the other ranks keep a doomed transfer alive.
+        #
+        # The allgather is GATED so steps with no remote-G2 load anywhere in the
+        # group skip the collective entirely. _coord_pending is mutated only by
+        # globally-consistent signals (the scheduler's started_loading_req_ids,
+        # which is replicated across TP ranks, and the collective's own output),
+        # so the gate predicate is identical on every rank — ranks always enter
+        # or skip the collective together; a one-sided skip would deadlock MPI.
+        # Invariant: _coord_pending ⊇ this rank's active loads, so the collective
+        # runs whenever any rank still has work to reconcile.
+        # Keep ids in their native type (request ids may be int or str); the
+        # rest of this method indexes _active_loads with that same type.
+        newly_started: set[int | str] = set(started_loading_req_ids)
+        self._coord_pending |= newly_started
+
+        globally_failed: set[int | str] = set(local_failed.keys())
+        if self._scope.enabled and self._coord_pending:
+            globally_active: set[int | str] = set()
+            for entry in self._scope.allgather(
+                {
+                    "failed": list(local_failed.keys()),
+                    "active": list(self._active_loads.keys()),
+                }
+            ):
+                # .get() tolerates an entry from a rank that has not yet been
+                # upgraded to the {"failed","active"} payload (defensive against
+                # rolling restarts); a missing key just contributes nothing.
+                globally_failed.update(entry.get("failed", ()))
+                globally_active.update(entry.get("active", ()))
+            # A request leaves coordination once no rank holds it active (failed
+            # ones are torn down below). Ids started this step are kept for one
+            # full step so we never trim ahead of start_load_kv.
+            self._coord_pending = {
+                rid
+                for rid in self._coord_pending
+                if rid in newly_started
+                or (rid in globally_active and rid not in globally_failed)
+            }
+        else:
+            # Single-rank, or nothing pending group-wide: the local view is the
+            # whole truth, so no collective is needed.
+            self._coord_pending = {
+                rid
+                for rid in self._coord_pending
+                if rid in newly_started or rid in self._active_loads
+            } - globally_failed
+
+        # Step 3: tear down every globally-failed load this rank still holds —
+        # including in-flight ones a sibling failed and ones that completed
+        # locally but lost the group (their blocks must be recomputed, not
+        # published).
+        for request_id in list(globally_failed):
+            active = self._active_loads.get(request_id)
+            if active is None:
+                continue
+            reason = local_failed.get(request_id, "sibling_transfer_failed")
+            self._fail_active_load(request_id, active, reason)
+
+        # Step 4: complete the locally-done loads that survived the group
+        # decision. _complete_success emits the appropriate event and releases
+        # the record on its own failure paths, so here we just surface the
+        # blocks for recompute and drop the load without raising.
+        finished_loading: list[int] = []
+        for request_id in local_done:
+            if request_id in globally_failed:
+                continue
+            active = self._active_loads.get(request_id)
+            if active is None:
+                continue
             record = active.result.record
-
-            # Poll for completion. A raised exception, an explicit NIXL
-            # failed state, or a timeout are all treated as a transfer
-            # failure: we record the affected block ids, release the
-            # handle + lease, and fall back to local recompute. Crucially we
-            # do NOT raise into the executor loop — a single failed transfer
-            # must not take down the engine, and the timeout is no longer the
-            # only way a mid-flight error surfaces.
-            completed = False
-            failure_reason: Optional[str] = None
-            try:
-                completed = bool(active.result.is_completed())
-            except Exception:
-                failure_reason = "transfer_failed"
-            else:
-                if not completed and self._result_failed(active.result):
-                    failure_reason = "transfer_failed"
-
-            if failure_reason is None and not completed:
-                if _now_ms() - active.started_at_ms > self._transfer_timeout_ms:
-                    failure_reason = "transfer_timeout"
-
-            if failure_reason is not None:
-                self._fail_active_load(request_id, active, failure_reason)
-                continue
-
-            if not completed:
-                continue
-
-            # Transfer reported success. Releasing the handle, marking the
-            # blocks locally valid, and publishing the binding can still
-            # fail; _complete_success emits the appropriate event and
-            # releases the record on its own failure paths, so here we just
-            # surface the blocks for recompute and drop the load without
-            # raising.
             self._release_transfer_result_once(active.result)
             self._emit_record_event(
                 "transferred",
@@ -394,6 +454,27 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
             self._completed_loads.add(request_id)
             finished_loading.append(int(request_id))
         return ([], finished_loading)
+
+    def _poll_status(
+        self, active: "_RemoteG2ActiveLoad"
+    ) -> tuple[LoadStatus, Optional[str]]:
+        """Classify a single in-flight load as DONE / FAILED / IN_FLIGHT.
+
+        A poll exception or an explicit NIXL failed state is a hard failure;
+        exceeding the transfer timeout is also a failure. Anything else is
+        still in flight.
+        """
+        try:
+            completed = bool(active.result.is_completed())
+        except Exception:
+            return LoadStatus.FAILED, "transfer_failed"
+        if completed:
+            return LoadStatus.DONE, None
+        if self._result_failed(active.result):
+            return LoadStatus.FAILED, "transfer_failed"
+        if _now_ms() - active.started_at_ms > self._transfer_timeout_ms:
+            return LoadStatus.FAILED, "transfer_timeout"
+        return LoadStatus.IN_FLIGHT, None
 
     def get_block_ids_with_load_errors(self) -> list[int]:
         """Return target-pool block ids whose remote-G2 load failed since the

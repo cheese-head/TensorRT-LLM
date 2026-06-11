@@ -192,8 +192,8 @@ def make_kv_pin_callbacks(
             return block_id
 
         # Fallback path for records produced outside of
-        # _lookup_via_find_block_by_hash (e.g. publisher-event-derived records that
-        # weren't pinned at lookup). Pin here for host-pinned records only.
+        # find_and_pin_descriptor_records (e.g. publisher-event-derived records
+        # that weren't pinned at lookup). Pin here for host-pinned records only.
         locations = kv_cache_manager.pin_blocks_by_id([block_id])
         if not locations:
             raise RuntimeError(

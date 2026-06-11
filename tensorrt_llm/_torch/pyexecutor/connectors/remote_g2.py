@@ -10,7 +10,9 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
+
+logger = logging.getLogger(__name__)
 
 try:
     from .remote_g2_observability import (
@@ -338,6 +340,20 @@ class RemoteG2Lease:
     trtllm_pin_refs: tuple[Any, ...] = ()
     released: bool = False
     release_reason: Optional[str] = None
+
+
+@dataclass
+class _SiblingPinLease:
+    """Pins a non-leader TP rank took while serving rank 0's intra-pod resolve.
+
+    These are reclaimed purely by TTL — there is no explicit release on the
+    sibling path. The deadline rides the *same* clock and origin as rank 0's
+    lease (resolve time + ``lease_ttl_ms``), so a sibling's pins live exactly as
+    long as the leader's and never expire out from under an in-flight read.
+    """
+
+    pin_refs: tuple[Any, ...]
+    expires_at_ms: int
 
 
 @dataclass(frozen=True)
@@ -882,6 +898,10 @@ class SourceG2DescriptorRegistry:
         self._tier = tier
         self._records: dict[int, SourceG2DescriptorRecord] = {}
         self._leases: dict[str, RemoteG2Lease] = {}
+        # Pins this rank took as a non-leader sibling, keyed by lease id and
+        # reclaimed by TTL (see register_sibling_pins / expire_sibling_pins).
+        # Empty on the leader, which releases its pins through its own leases.
+        self._sibling_pins: dict[str, _SiblingPinLease] = {}
         self._lock = threading.RLock()
 
     def upsert_descriptor(self, record: SourceG2DescriptorRecord) -> None:
@@ -1104,6 +1124,51 @@ class SourceG2DescriptorRegistry:
         with self._lock:
             return self._leases.get(lease_id)
 
+    def register_sibling_pins(
+        self, lease_id: str, pin_refs: Sequence[Any]
+    ) -> None:
+        """Record pins this rank took serving the leader's intra-pod resolve.
+
+        Reclaimed solely by TTL on the same clock as the leader's lease, so the
+        sibling path needs no explicit release RPC. Repeated resolves for the
+        same lease accumulate pins and refresh the deadline.
+        """
+        refs = tuple(pin_refs)
+        if not refs:
+            return
+        with self._lock:
+            existing = self._sibling_pins.get(lease_id)
+            self._sibling_pins[lease_id] = _SiblingPinLease(
+                pin_refs=(existing.pin_refs + refs) if existing else refs,
+                expires_at_ms=self._clock_ms() + self.lease_ttl_ms,
+            )
+
+    def expire_sibling_pins(self, now_ms: Optional[int] = None) -> int:
+        """Release every sibling pin whose TTL has elapsed; return the count.
+
+        A no-op on the leader (which never registers sibling pins) and safe to
+        call from a background sweeper or lazily on the request path.
+        """
+        now = now_ms if now_ms is not None else self._clock_ms()
+        with self._lock:
+            expired = [
+                lease_id
+                for lease_id, pins in self._sibling_pins.items()
+                if pins.expires_at_ms <= now
+            ]
+            for lease_id in expired:
+                pins = self._sibling_pins.pop(lease_id)
+                for pin_ref in pins.pin_refs:
+                    try:
+                        self._release_pin_ref(pin_ref)
+                    except Exception:
+                        logger.exception(
+                            "remote_g2: sibling pin release failed "
+                            "(lease=%s pin=%s)",
+                            lease_id, pin_ref,
+                        )
+        return len(expired)
+
     def _release_pin_ref(self, pin_ref: Any) -> None:
         if self._release_pin is not None:
             self._release_pin(pin_ref)
@@ -1180,3 +1245,32 @@ class SourceG2DescriptorRegistry:
         # can unpin once the transfer completes.
         record._pinned_by_lookup = True
         return record
+
+    def find_and_pin_descriptor_records(
+        self, block_hashes: Sequence[int]
+    ) -> list[Optional[SourceG2DescriptorRecord]]:
+        """Batched lookup-and-pin returning descriptor records.
+
+        Resolves the whole contiguous prefix in a single
+        find_and_pin_blocks_by_hash call (atomic per-block pin under the
+        lookup-tree mutex, stop_on_miss prefix semantics) and maps each hit to
+        a descriptor record already pinned in the host-pinned tier. The result
+        is aligned to ``block_hashes``: a miss — or any hash past the first
+        miss — maps to None.
+
+        Because returned blocks are pinned at lookup time, every caller is
+        responsible for releasing them: rank 0 via the lease's trtllm_pin_refs,
+        sibling ranks via register_sibling_pins (reclaimed by TTL).
+        """
+        hashes = [int(h) for h in block_hashes]
+        if not hashes:
+            return []
+        results = self._find_and_pin_blocks_by_hash(tuple(hashes))
+        records: list[Optional[SourceG2DescriptorRecord]] = []
+        for i in range(len(hashes)):
+            result = results[i] if i < len(results) else None
+            if isinstance(result, PinnedCacheBlock):
+                records.append(self._record_from_pinned_cache_block(result))
+            else:
+                records.append(None)
+        return records

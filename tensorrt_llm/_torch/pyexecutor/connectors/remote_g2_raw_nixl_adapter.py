@@ -320,9 +320,11 @@ class RawNixlRemoteG2Adapter:
 
         # T3: Determine which source rank's metadata to use.
         # With TP>1, each target rank loads its corresponding source
-        # rank's NIXL agent and uses that rank's descriptors.
-        from tensorrt_llm._utils import mpi_rank as _mpi_rank
-        my_rank = _mpi_rank()
+        # rank's NIXL agent and uses that rank's descriptors. The TP-local
+        # rank (DP-aware) comes from the shared RankScope so peer indexing
+        # has a single source of truth instead of a raw mpi_rank() call.
+        from .remote_g2_group import current_local_rank
+        my_rank = current_local_rank()
 
         resolve_result = record.resolve_result
         per_rank_meta = getattr(resolve_result, "per_rank_source_metadata", {})

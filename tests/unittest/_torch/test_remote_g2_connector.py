@@ -38,6 +38,14 @@ _REMOTE_G2_OBSERVABILITY_PATH = (
     / "connectors"
     / "remote_g2_observability.py"
 )
+_REMOTE_G2_GROUP_PATH = (
+    _ROOT
+    / "tensorrt_llm"
+    / "_torch"
+    / "pyexecutor"
+    / "connectors"
+    / "remote_g2_group.py"
+)
 
 
 def _install_package(name):
@@ -94,15 +102,28 @@ def _load_connector_modules():
     remote_g2_transfer = _load_module(
         f"{_CONNECTOR_PACKAGE}.remote_g2_transfer", _REMOTE_G2_TRANSFER_PATH
     )
+    remote_g2_group = _load_module(
+        f"{_CONNECTOR_PACKAGE}.remote_g2_group", _REMOTE_G2_GROUP_PATH
+    )
     remote_g2_connector = _load_module(
         f"{_CONNECTOR_PACKAGE}.remote_g2_connector", _REMOTE_G2_CONNECTOR_PATH
     )
-    return remote_g2, remote_g2_transfer, remote_g2_connector, observability
+    return (
+        remote_g2,
+        remote_g2_transfer,
+        remote_g2_connector,
+        observability,
+        remote_g2_group,
+    )
 
 
-REMOTE_G2, REMOTE_G2_TRANSFER, REMOTE_G2_CONNECTOR, OBSERVABILITY = (
-    _load_connector_modules()
-)
+(
+    REMOTE_G2,
+    REMOTE_G2_TRANSFER,
+    REMOTE_G2_CONNECTOR,
+    OBSERVABILITY,
+    REMOTE_G2_GROUP,
+) = _load_connector_modules()
 
 RemoteG2ConnectorMetadata = REMOTE_G2_CONNECTOR.RemoteG2ConnectorMetadata
 RemoteG2Descriptor = REMOTE_G2.RemoteG2Descriptor
@@ -110,6 +131,19 @@ RemoteG2ResolveResult = REMOTE_G2.RemoteG2ResolveResult
 TargetRemotePlanStore = REMOTE_G2.TargetRemotePlanStore
 TargetRemoteG2BindingStore = REMOTE_G2.TargetRemoteG2BindingStore
 InMemoryRemoteG2ObservabilitySink = OBSERVABILITY.InMemoryRemoteG2ObservabilitySink
+RankScope = REMOTE_G2_GROUP.RankScope
+LoadStatus = REMOTE_G2_GROUP.LoadStatus
+
+
+def _tp_scope(local_rank, world_size, allgather):
+    """A multi-rank RankScope with an injected allgather for tests (no MPI)."""
+    return RankScope(
+        world_rank=local_rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        tp_size=world_size,
+        _allgather=allgather,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -803,3 +837,175 @@ def test_worker_init_succeeds_when_partial_reuse_disabled():
     REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
         _llm_args_with_partial_reuse(False)
     )
+
+
+# --- RankScope (TP rank-group abstraction) -------------------------------
+
+
+def test_rank_scope_single_rank_allgather_is_identity():
+    scope = RankScope(world_rank=0, world_size=1, local_rank=0, tp_size=1)
+    assert scope.enabled is False
+    assert scope.is_leader is True
+    assert scope.allgather("x") == ["x"]
+
+
+def test_rank_scope_injected_allgather_is_used():
+    seen = []
+    scope = _tp_scope(0, 2, lambda v: seen.append(v) or [v, ["sibling"]])
+    assert scope.enabled is True
+    assert scope.allgather(["mine"]) == [["mine"], ["sibling"]]
+    assert seen == [["mine"]]
+
+
+def test_rank_scope_detect_falls_back_to_single_rank_without_mpi():
+    # In the unit-test environment tensorrt_llm._utils is not importable, so
+    # detect() must degrade to a trivial single-rank scope rather than raise.
+    scope = RankScope.detect(None)
+    assert scope.world_size == 1
+    assert scope.local_rank == 0
+    assert scope.enabled is False
+
+
+# --- Worker get_finished as a TP-group decision (P0) ---------------------
+
+
+def test_remote_g2_worker_group_failure_on_sibling_tears_down_local_load():
+    # Under TP>1 every rank runs its own transfer. This rank's transfer
+    # SUCCEEDED, but a sibling rank reports the request failed. The request
+    # must be torn down here too (blocks recorded for recompute, lease
+    # released) and NOT reported as finished — otherwise the framework's
+    # all-ranks completion intersection would publish a half-loaded request.
+    released = []
+    published = []
+    result = None
+
+    def make_result(record):
+        nonlocal result
+        result = _FakeTransferResult(record, completed=True)
+        return result
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
+        or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=published.append,
+    )
+    # rank 1 (sibling) reports request 1234 as failed; this rank reports none.
+    # The gated collective exchanges {"failed", "active"} entries per rank.
+    worker._scope = _tp_scope(
+        0, 2, lambda entry: [entry, {"failed": [1234], "active": [1234]}]
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    assert worker.get_finished([], [1234]) == ([], [])
+    assert worker.get_block_ids_with_load_errors() == [101, 102]
+    assert released == [("lease-bound", "sibling_transfer_failed")]
+    assert published == []
+    assert result.released == 1
+
+
+def test_remote_g2_worker_group_success_when_no_rank_failed():
+    # This rank's transfer is done and no rank reports a failure, so the
+    # request finishes normally.
+    released = []
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(),
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
+        or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    # Sibling still has the load active but reports no failure.
+    worker._scope = _tp_scope(
+        0, 2, lambda entry: [entry, {"failed": [], "active": [1234]}]
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    assert worker.get_finished([], [1234]) == ([], [1234])
+    assert released == [("lease-bound", "transfer_succeeded")]
+
+
+def test_remote_g2_worker_group_local_failure_unioned_across_ranks():
+    # A failure detected locally is reported through the group allgather and
+    # still tears the load down (parity with the TP=1 failure path).
+    released = []
+    result = None
+
+    def make_result(record):
+        nonlocal result
+        result = _FakeTransferResult(record, completed=False, failed=True)
+        return result
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(make_result),
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
+        or True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    seen = []
+    worker._scope = _tp_scope(
+        0,
+        2,
+        lambda entry: seen.append(list(entry["failed"]))
+        or [entry, {"failed": [], "active": []}],
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    assert worker.get_finished([], [1234]) == ([], [])
+    assert seen == [[1234]]  # this rank's local failure entered the allgather
+    assert worker.get_block_ids_with_load_errors() == [101, 102]
+    assert released == [("lease-bound", "transfer_failed")]
+
+
+# --- Gating the group collective on idle steps (P0 cost) -----------------
+
+
+def test_remote_g2_worker_skips_collective_when_nothing_pending():
+    # With no active loads and nothing started, the group decision is a no-op,
+    # so the (potentially per-step) collective must be skipped entirely. The
+    # gate predicate is driven only by globally-consistent inputs, so all ranks
+    # skip together — a one-sided skip would deadlock MPI.
+    calls = []
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker._scope = _tp_scope(
+        0, 2, lambda entry: calls.append(entry) or [entry, entry]
+    )
+
+    assert worker.get_finished([], []) == ([], [])
+    assert calls == []  # collective skipped
+
+
+def test_remote_g2_worker_runs_collective_once_a_load_is_pending():
+    # A started load seeds the coordination set (a globally-consistent signal),
+    # so every rank enters the collective on that step.
+    calls = []
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker._scope = _tp_scope(
+        0, 2, lambda entry: calls.append(entry) or [entry, entry]
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)
+
+    assert worker.get_finished([], [1234]) == ([], [1234])
+    assert len(calls) == 1
+    assert calls[0]["active"] == [1234]

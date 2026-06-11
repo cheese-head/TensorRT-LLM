@@ -178,13 +178,21 @@ def _ipc_socket_path(dynamo_pid: int, tp_rank: int = 0, tp_size: int = 1) -> str
 
 
 def _query_sibling_rank(
-    dynamo_pid: int, sibling_rank: int, tp_size: int, block_hashes: list[int],
+    dynamo_pid: int,
+    sibling_rank: int,
+    tp_size: int,
+    block_hashes: list[int],
+    lease_id: Optional[str] = None,
 ) -> list[dict]:
     """Query a sibling TP rank's ZMQ REP for descriptors via intra-pod IPC.
 
     Returns a list of descriptor dicts (one per block_hash, None entries
     for blocks not found on that rank). Sub-millisecond — Unix domain
     socket on the same pod.
+
+    The sibling pins each block it resolves (find-and-pin lookup). The
+    lease_id is threaded through so the sibling can register those pins
+    against the lease and reclaim them by TTL (see register_sibling_pins).
     """
     import zmq
 
@@ -197,7 +205,7 @@ def _query_sibling_rank(
         req.connect(f"ipc://{sibling_path}")
         req.send(pickle.dumps({
             "method": "resolve_hashes",
-            "payload": {"block_hashes": block_hashes},
+            "payload": {"block_hashes": block_hashes, "lease_id": lease_id},
         }))
         raw = req.recv()
         resp = pickle.loads(raw)
@@ -216,6 +224,24 @@ def _query_sibling_rank(
         return []
     finally:
         req.close()
+
+
+def _descs_from_records(records: list) -> list:
+    """Serialize resolved descriptor records into the wire dict shape used by
+    the per-rank gather (None entries pass through for misses)."""
+    descs = []
+    for record in records:
+        if record is None:
+            descs.append(None)
+        else:
+            descs.append({
+                "block_hash": record.block_hash,
+                "byte_offset": record.byte_offset,
+                "byte_length": record.byte_length,
+                "pool_id": record.pool_id,
+                "metadata": dict(record.metadata or {}),
+            })
+    return descs
 
 
 def _start_zmq_rep_service(
@@ -245,6 +271,28 @@ def _start_zmq_rep_service(
     rep = ctx.socket(zmq.REP)
     rep.bind(f"ipc://{socket_path}")
 
+    # Sibling ranks pin blocks while serving rank 0's intra-pod resolve_hashes
+    # and reclaim them purely by TTL (registry.register_sibling_pins records
+    # them on the leader's lease clock). A background sweeper guarantees idle
+    # ranks still reclaim; the request path also sweeps lazily. Harmless no-op
+    # on the leader, which holds no sibling pins.
+    if tp_size > 1:
+        sweep_interval_s = max(1.0, min(registry.lease_ttl_ms / 2000.0, 10.0))
+
+        def _sibling_pin_sweeper() -> None:
+            while True:
+                time.sleep(sweep_interval_s)
+                try:
+                    registry.expire_sibling_pins()
+                except Exception:
+                    logging.exception("remote_g2: sibling pin sweeper error")
+
+        threading.Thread(
+            target=_sibling_pin_sweeper,
+            name=f"remote_g2_pin_sweeper_r{tp_rank}",
+            daemon=True,
+        ).start()
+
     def _loop() -> None:
         while True:
             method = "<unparsed>"
@@ -257,25 +305,24 @@ def _start_zmq_rep_service(
                 req = pickle.loads(raw)
                 method = req.get("method")
                 payload = req.get("payload") or {}
+                # Lazy TTL sweep on the request path so active ranks reclaim
+                # promptly without waiting for the background sweeper tick.
+                registry.expire_sibling_pins()
                 if method == "resolve_hashes":
-                    # Intra-pod query from rank 0: look up block hashes
-                    # on THIS rank's registry and return descriptors.
+                    # Intra-pod query from rank 0: look up the whole prefix on
+                    # THIS rank's registry in one batched find-and-pin call and
+                    # return descriptors. Each hit is pinned; register the pins
+                    # on the lease so they are reclaimed by TTL (no explicit
+                    # release on the sibling path — see register_sibling_pins).
                     hashes = payload.get("block_hashes", [])
-                    descs = []
-                    for bh in hashes:
-                        record = registry._lookup_via_find_block_by_hash(bh)
-                        if record is not None:
-                            descs.append({
-                                "block_hash": record.block_hash,
-                                "byte_offset": record.byte_offset,
-                                "byte_length": record.byte_length,
-                                "pool_id": record.pool_id,
-                                "metadata": dict(record.metadata or {}),
-                            })
-                        else:
-                            descs.append(None)
-                    response = {"ok": True, "result": descs}
-
+                    lease_id = payload.get("lease_id")
+                    records = registry.find_and_pin_descriptor_records(hashes)
+                    if lease_id is not None:
+                        registry.register_sibling_pins(
+                            lease_id,
+                            [int(r.block_id) for r in records if r is not None],
+                        )
+                    response = {"ok": True, "result": _descs_from_records(records)}
                 elif method == "resolve_and_lease":
                     result = registry.resolve_and_lease(payload.get("plan"))
                     result_dict = _result_to_dict(result)
@@ -296,12 +343,15 @@ def _start_zmq_rep_service(
                             }
                             for d in result.descriptors
                         ]}
-                        # Query each sibling rank via local ZMQ IPC.
+                        # Query each sibling rank via local ZMQ IPC. The
+                        # lease_id lets each sibling register the pins it takes
+                        # under that lease so they expire on the lease's TTL.
                         for sibling in range(tp_size):
                             if sibling == tp_rank:
                                 continue
                             sibling_descs = _query_sibling_rank(
                                 dynamo_pid, sibling, tp_size, block_hashes,
+                                lease_id=result.lease_id,
                             )
                             if sibling_descs:
                                 per_rank_descs[sibling] = sibling_descs
@@ -323,6 +373,9 @@ def _start_zmq_rep_service(
 
                     response = {"ok": True, "result": result_dict}
                 elif method == "release_lease":
+                    # Releases the leader's own lease pins immediately. Sibling
+                    # pins are not released here — they expire by TTL on the same
+                    # clock as this lease (see register_sibling_pins).
                     completed = registry.release_lease(
                         payload["lease_id"], payload.get("reason", "ack")
                     )
@@ -663,20 +716,9 @@ def _gather_per_rank_descriptors(
     # Each rank resolves locally using its own registry. We use the
     # internal find-and-pin path to get descriptors without creating
     # a lease (the lease is managed by rank 0's resolve_and_lease).
-    local_descs = []
-    for bh in hashes:
-        record = local_registry._lookup_via_find_block_by_hash(bh)
-        if record is not None:
-            local_descs.append({
-                "block_hash": record.block_hash,
-                "byte_offset": record.byte_offset,
-                "byte_length": record.byte_length,
-                "pool_id": record.pool_id,
-                "metadata": record.metadata,
-            })
-        else:
-            # Block not found on this rank — signal with None.
-            local_descs.append(None)
+    local_descs = _descs_from_records(
+        local_registry.find_and_pin_descriptor_records(hashes)
+    )
 
     # Gather from all ranks. Each rank contributes its descriptor list.
     from tensorrt_llm._utils import mpi_rank
@@ -725,20 +767,10 @@ def _start_sibling_rank_resolve_loop(
                     )
                     return
 
-                # Local resolve for each hash.
-                local_descs = []
-                for bh in hashes:
-                    record = registry._lookup_via_find_block_by_hash(bh)
-                    if record is not None:
-                        local_descs.append({
-                            "block_hash": record.block_hash,
-                            "byte_offset": record.byte_offset,
-                            "byte_length": record.byte_length,
-                            "pool_id": record.pool_id,
-                            "metadata": record.metadata,
-                        })
-                    else:
-                        local_descs.append(None)
+                # Local resolve for the whole prefix in one batched call.
+                local_descs = _descs_from_records(
+                    registry.find_and_pin_descriptor_records(hashes)
+                )
 
                 # Participate in the gather back to rank 0.
                 mpi_allgather({

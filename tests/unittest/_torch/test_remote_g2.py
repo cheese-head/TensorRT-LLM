@@ -783,3 +783,67 @@ def test_remote_g2_terminal_cleanup_releases_lease_once_for_all_reasons():
         assert record.state is expected_state
 
     assert released == [(f"lease-{reason}", reason) for reason, _ in cases]
+
+
+# --- Sibling pins reclaimed by TTL (no explicit release on the sibling path) -
+
+
+def test_sibling_pins_are_reclaimed_only_after_ttl():
+    # A non-leader TP rank pins blocks while serving the leader's intra-pod
+    # resolve. There is no explicit release on that path — the pins must live
+    # until the lease TTL elapses (the same clock the leader's lease rides), so
+    # they never expire out from under an in-flight read.
+    clock = {"now": 1_000}
+    released = []
+    registry = SourceG2DescriptorRegistry(
+        source_worker_id=7,
+        source_dp_rank=0,
+        clock_ms=lambda: clock["now"],
+        lease_ttl_ms=5_000,
+        release_pin=released.append,
+    )
+
+    registry.register_sibling_pins("lease-A", [101, 102])
+
+    # Still within the TTL: nothing is reclaimed.
+    clock["now"] = 1_000 + 5_000 - 1
+    assert registry.expire_sibling_pins() == 0
+    assert released == []
+
+    # At the deadline (same <= semantics as lease expiry) the pins are released,
+    # exactly once.
+    clock["now"] = 1_000 + 5_000
+    assert registry.expire_sibling_pins() == 1
+    assert released == [101, 102]
+    assert registry.expire_sibling_pins() == 0  # idempotent
+
+
+def test_register_sibling_pins_accumulates_and_refreshes_deadline():
+    clock = {"now": 0}
+    released = []
+    registry = SourceG2DescriptorRegistry(
+        source_worker_id=7,
+        source_dp_rank=0,
+        clock_ms=lambda: clock["now"],
+        lease_ttl_ms=1_000,
+        release_pin=released.append,
+    )
+
+    registry.register_sibling_pins("lease-A", [11])
+    clock["now"] = 500
+    registry.register_sibling_pins("lease-A", [22])  # refreshes deadline to 1500
+
+    # At 1200 the original pin would have expired, but the refresh keeps both.
+    clock["now"] = 1_200
+    assert registry.expire_sibling_pins() == 0
+    assert released == []
+
+    clock["now"] = 1_501
+    assert registry.expire_sibling_pins() == 1
+    assert sorted(released) == [11, 22]
+
+
+def test_register_sibling_pins_empty_is_noop():
+    registry = SourceG2DescriptorRegistry(source_worker_id=7, source_dp_rank=0)
+    registry.register_sibling_pins("lease-A", [])
+    assert registry.expire_sibling_pins() == 0
