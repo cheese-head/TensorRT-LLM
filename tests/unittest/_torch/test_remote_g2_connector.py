@@ -131,13 +131,13 @@ RemoteG2ResolveResult = REMOTE_G2.RemoteG2ResolveResult
 TargetRemotePlanStore = REMOTE_G2.TargetRemotePlanStore
 TargetRemoteG2BindingStore = REMOTE_G2.TargetRemoteG2BindingStore
 InMemoryRemoteG2ObservabilitySink = OBSERVABILITY.InMemoryRemoteG2ObservabilitySink
-RankScope = REMOTE_G2_GROUP.RankScope
+TPGroup = REMOTE_G2_GROUP.TPGroup
 LoadStatus = REMOTE_G2_GROUP.LoadStatus
 
 
-def _tp_scope(local_rank, world_size, allgather):
-    """A multi-rank RankScope with an injected allgather for tests (no MPI)."""
-    return RankScope(
+def _tp_group(local_rank, world_size, allgather):
+    """A multi-rank TPGroup with an injected allgather for tests (no MPI)."""
+    return TPGroup(
         world_rank=local_rank,
         world_size=world_size,
         local_rank=local_rank,
@@ -239,14 +239,18 @@ class _FakeTransferAdapter:
 
 
 def _bound_record(lease_id="lease-bound"):
+    return _bound_record_for(1234, lease_id=lease_id)
+
+
+def _bound_record_for(request_id, lease_id="lease-bound"):
     store = TargetRemoteG2BindingStore(release_lease=lambda lease_id, reason: True)
     record = store.resolve_for_request(
-        1234,
+        request_id,
         _plan(),
         16,
         lambda plan: _resolve_result(lease_id=lease_id),
     )
-    store.bind_target_blocks(1234, [100, 101, 102])
+    store.bind_target_blocks(request_id, [100, 101, 102])
     return record
 
 
@@ -344,6 +348,39 @@ def test_remote_g2_connector_binds_after_allocated_block_ids():
     ]
 
 
+def test_remote_g2_connector_emits_transfer_ready_binding_once():
+    # A BOUND record stays transfer-ready until request_finished. To avoid
+    # re-broadcasting it every tick, build_connector_meta emits each binding
+    # exactly once; a finished-and-re-resolved request emits again.
+    plan_store = TargetRemotePlanStore(clock_ms=lambda: 500)
+    plan_store.put(1234, _plan())
+    scheduler = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorScheduler(
+        None,
+        plan_store=plan_store,
+        resolve_and_lease=lambda plan: _resolve_result(),
+        release_lease=lambda lease_id, reason: True,
+    )
+    request = SimpleNamespace(request_id=1234)
+    scheduler.get_num_new_matched_tokens(request, 16)
+    scheduler.update_state_after_alloc(request, [100, 101, 102])
+
+    output = SimpleNamespace(new_requests=[], cached_requests=[])
+    first = scheduler.build_connector_meta(output)
+    second = scheduler.build_connector_meta(output)
+
+    assert len(first.bindings) == 1
+    assert second.bindings == ()  # not re-emitted on the next tick
+
+    # After the request finishes, a fresh request resolves and emits again.
+    scheduler.request_finished(request, [])
+    plan_store.put(5678, _plan())
+    request2 = SimpleNamespace(request_id=5678)
+    scheduler.get_num_new_matched_tokens(request2, 16)
+    scheduler.update_state_after_alloc(request2, [100, 101, 102])
+    third = scheduler.build_connector_meta(output)
+    assert len(third.bindings) == 1
+
+
 def test_remote_g2_connector_releases_once_on_request_finished():
     released = []
     plan_store = TargetRemotePlanStore(clock_ms=lambda: 500)
@@ -365,15 +402,49 @@ def test_remote_g2_connector_releases_once_on_request_finished():
     assert plan_store.get(1234) is None
 
 
-def test_remote_g2_worker_refuses_transfer_before_phase5():
-    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(None)
+def test_remote_g2_worker_missing_adapter_falls_back_without_raising():
+    # A missing transfer adapter is a supported state (NIXL build disabled).
+    # start_load_kv must NOT raise into the executor loop; instead it surfaces
+    # the affected target blocks for local recompute and releases the lease.
+    released = []
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
+        or True,
+    )
 
     worker.bind_connector_meta(RemoteG2ConnectorMetadata())
     worker.start_load_kv(None)
 
     worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
-    with pytest.raises(RuntimeError, match="transfer adapter is not configured"):
-        worker.start_load_kv(None)
+    worker.start_load_kv(None)  # must not raise
+
+    assert worker.get_block_ids_with_load_errors() == [101, 102]
+    assert released == [("lease-bound", "transfer_adapter_missing")]
+
+
+def test_remote_g2_worker_transfer_start_failure_falls_back_without_raising():
+    # If the adapter's start_transfer raises, the record falls back to local
+    # recompute (blocks reported, lease released) and the batch continues —
+    # no exception escapes into the executor loop.
+    released = []
+
+    class _RaisingAdapter:
+        def start_transfer(self, record):
+            raise RuntimeError("boom")
+
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_RaisingAdapter(),
+        release_lease=lambda lease_id, reason: released.append((lease_id, reason))
+        or True,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
+    worker.start_load_kv(None)  # must not raise
+
+    assert worker.get_block_ids_with_load_errors() == [101, 102]
+    assert released == [("lease-bound", "transfer_start_failed")]
+    assert worker.get_finished([], [1234]) == ([], [])
 
 
 def test_remote_g2_worker_starts_transfer_for_bound_metadata():
@@ -839,31 +910,117 @@ def test_worker_init_succeeds_when_partial_reuse_disabled():
     )
 
 
-# --- RankScope (TP rank-group abstraction) -------------------------------
+# --- TPGroup (TP rank-group abstraction) ---------------------------------
 
 
-def test_rank_scope_single_rank_allgather_is_identity():
-    scope = RankScope(world_rank=0, world_size=1, local_rank=0, tp_size=1)
-    assert scope.enabled is False
-    assert scope.is_leader is True
-    assert scope.allgather("x") == ["x"]
+def test_tp_group_single_rank_allgather_is_identity():
+    group = TPGroup(world_rank=0, world_size=1, local_rank=0, tp_size=1)
+    assert group.enabled is False
+    assert group.is_leader is True
+    assert group.allgather("x") == ["x"]
 
 
-def test_rank_scope_injected_allgather_is_used():
+def test_tp_group_injected_allgather_is_used():
     seen = []
-    scope = _tp_scope(0, 2, lambda v: seen.append(v) or [v, ["sibling"]])
-    assert scope.enabled is True
-    assert scope.allgather(["mine"]) == [["mine"], ["sibling"]]
+    group = _tp_group(0, 2, lambda v: seen.append(v) or [v, ["sibling"]])
+    assert group.enabled is True
+    assert group.allgather(["mine"]) == [["mine"], ["sibling"]]
     assert seen == [["mine"]]
 
 
-def test_rank_scope_detect_falls_back_to_single_rank_without_mpi():
+def test_tp_group_detect_falls_back_to_single_rank_without_mpi():
     # In the unit-test environment tensorrt_llm._utils is not importable, so
-    # detect() must degrade to a trivial single-rank scope rather than raise.
-    scope = RankScope.detect(None)
-    assert scope.world_size == 1
-    assert scope.local_rank == 0
-    assert scope.enabled is False
+    # detect() must degrade to a trivial single-rank group rather than raise.
+    group = TPGroup.detect(None)
+    assert group.world_size == 1
+    assert group.local_rank == 0
+    assert group.enabled is False
+
+
+def test_tp_group_agree_single_rank_is_mpi_free():
+    # Single-rank: agree reflects the local ok and returns just the local value
+    # without touching MPI.
+    group = TPGroup(world_rank=0, world_size=1, local_rank=0, tp_size=1)
+    assert group.agree("payload", ok=True) == (True, ["payload"])
+    assert group.agree(None, ok=False) == (False, [None])
+
+
+def test_tp_group_agree_all_ranks_ok():
+    # Every rank contributes ok=True -> all_ok True, values gathered in order.
+    captured = []
+
+    def fake_allgather(value):
+        captured.append(value)
+        return [value, {"ok": True, "value": "sibling"}]
+
+    group = _tp_group(0, 2, fake_allgather)
+    all_ok, values = group.agree("mine", ok=True)
+    assert all_ok is True
+    assert values == ["mine", "sibling"]
+    # The payload carries the explicit ok flag, never a skipped call.
+    assert captured == [{"ok": True, "value": "mine"}]
+
+
+def test_tp_group_agree_reports_not_ok_when_any_rank_failed():
+    # One rank reports ok=False (e.g. its NIXL bundle failed to build); agree
+    # surfaces all_ok=False on every rank so the group can decide symmetrically.
+    group = _tp_group(
+        0, 2, lambda entry: [entry, {"ok": False, "value": None}]
+    )
+    all_ok, values = group.agree({"meta": 1}, ok=True)
+    assert all_ok is False
+    assert values == [{"meta": 1}, None]
+
+
+def test_tp_group_agree_tp_subgroup_uses_injected_allgather():
+    # With an injected allgather (tests) or when the subgroup equals the world,
+    # agree_tp_subgroup must not touch MPI's Split — it delegates to agree.
+    group = _tp_group(
+        0, 2, lambda entry: [entry, {"ok": True, "value": "sibling"}]
+    )
+    all_ok, values = group.agree_tp_subgroup("mine", ok=True)
+    assert all_ok is True
+    assert values == ["mine", "sibling"]
+
+
+def test_tp_group_agree_tp_subgroup_single_rank_is_mpi_free():
+    group = TPGroup(world_rank=0, world_size=1, local_rank=0, tp_size=1)
+    assert group.agree_tp_subgroup("payload", ok=True) == (True, ["payload"])
+
+
+# --- Bounded dedup state (worker memory) ---------------------------------
+
+
+def test_bounded_key_set_evicts_oldest_over_cap():
+    s = REMOTE_G2_CONNECTOR._BoundedKeySet(max_size=3)
+    for i in range(3):
+        s.add(i)
+    assert all(i in s for i in range(3))
+    s.add(3)  # over cap -> evict oldest (0)
+    assert 0 not in s
+    assert all(i in s for i in (1, 2, 3))
+    assert len(s) == 3
+    # Re-adding an existing key refreshes recency without growing.
+    s.add(1)
+    s.add(4)  # evicts the now-oldest (2), not the refreshed 1
+    assert 2 not in s
+    assert 1 in s and 4 in s
+
+
+def test_remote_g2_worker_finished_loading_preserves_string_request_id():
+    # request ids may be non-numeric strings; get_finished must return them
+    # unchanged rather than int()-casting (which would raise).
+    record = _bound_record_for("req-abc")
+    worker = REMOTE_G2_CONNECTOR.RemoteG2KvCacheConnectorWorker(
+        None,
+        transfer_adapter=_FakeTransferAdapter(),
+        release_lease=lambda lease_id, reason: True,
+        mark_local_valid=lambda record: None,
+        publish_binding=lambda record: None,
+    )
+    worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(record,)))
+    worker.start_load_kv(None)
+    assert worker.get_finished([], ["req-abc"]) == ([], ["req-abc"])
 
 
 # --- Worker get_finished as a TP-group decision (P0) ---------------------
@@ -894,7 +1051,7 @@ def test_remote_g2_worker_group_failure_on_sibling_tears_down_local_load():
     )
     # rank 1 (sibling) reports request 1234 as failed; this rank reports none.
     # The gated collective exchanges {"failed", "active"} entries per rank.
-    worker._scope = _tp_scope(
+    worker._tp_group = _tp_group(
         0, 2, lambda entry: [entry, {"failed": [1234], "active": [1234]}]
     )
     worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
@@ -920,7 +1077,7 @@ def test_remote_g2_worker_group_success_when_no_rank_failed():
         publish_binding=lambda record: None,
     )
     # Sibling still has the load active but reports no failure.
-    worker._scope = _tp_scope(
+    worker._tp_group = _tp_group(
         0, 2, lambda entry: [entry, {"failed": [], "active": [1234]}]
     )
     worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))
@@ -950,7 +1107,7 @@ def test_remote_g2_worker_group_local_failure_unioned_across_ranks():
         publish_binding=lambda record: None,
     )
     seen = []
-    worker._scope = _tp_scope(
+    worker._tp_group = _tp_group(
         0,
         2,
         lambda entry: seen.append(list(entry["failed"]))
@@ -981,7 +1138,7 @@ def test_remote_g2_worker_skips_collective_when_nothing_pending():
         mark_local_valid=lambda record: None,
         publish_binding=lambda record: None,
     )
-    worker._scope = _tp_scope(
+    worker._tp_group = _tp_group(
         0, 2, lambda entry: calls.append(entry) or [entry, entry]
     )
 
@@ -1000,7 +1157,7 @@ def test_remote_g2_worker_runs_collective_once_a_load_is_pending():
         mark_local_valid=lambda record: None,
         publish_binding=lambda record: None,
     )
-    worker._scope = _tp_scope(
+    worker._tp_group = _tp_group(
         0, 2, lambda entry: calls.append(entry) or [entry, entry]
     )
     worker.bind_connector_meta(RemoteG2ConnectorMetadata(bindings=(_bound_record(),)))

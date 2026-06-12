@@ -76,51 +76,83 @@ def get_per_rank_nixl_bundles() -> Optional[list[dict]]:
 
 
 def _gather_per_rank_nixl_metadata(
-    local_bundle: _NixlSourceBundle,
+    local_bundle: Optional[_NixlSourceBundle],
     tp_rank: int,
     tp_size: int,
-) -> list[dict]:
-    """S1: MPI allgather of per-rank NIXL agent metadata at startup.
+) -> Optional[list[dict]]:
+    """S1: symmetric exchange of per-rank NIXL agent metadata at startup.
 
-    Every TP rank contributes its own (agent_name, agent_desc,
-    pool_base_ptr, pool_size_bytes) and receives the full list.
-    Uses MPI world communicator (safe when DP OFF, i.e. world = TP group).
+    Every TP rank calls this unconditionally — *including* a rank whose NIXL
+    bundle failed to build (``local_bundle is None``). A missing bundle is
+    carried as an ``ok=False`` payload, never a skipped collective, so a rank
+    that failed locally can never leave its siblings blocked in the allgather.
 
-    For DP ON deployments, this must be replaced with a TP-group-scoped
-    communicator to avoid cross-DP-group contamination.
+    Under TP>1, if *any* rank could not build a bundle the whole group raises
+    identically — a loud, consistent startup failure rather than a half-enabled
+    transfer group. Under TP=1 a missing bundle simply disables transfer
+    (returns ``None``); there is no group to diverge from.
+
+    Uses the MPI world communicator (safe when DP is off, i.e. world == TP
+    group). For DP-on deployments this must be scoped to the TP subgroup to
+    avoid cross-DP-group contamination.
     """
     import base64 as _b64
 
-    from tensorrt_llm._utils import mpi_allgather
-
-    local_entry = {
-        "tp_rank": tp_rank,
-        "remote_name": local_bundle.remote_name,
-        "agent_metadata_b64": _b64.b64encode(
-            local_bundle.agent_desc
-        ).decode("ascii"),
-        "pool_base_ptr": local_bundle.pool_base_ptr,
-        "pool_size_bytes": local_bundle.pool_size_bytes,
-        "source_generation": local_bundle.source_generation,
-    }
+    local_entry: Optional[dict] = None
+    if local_bundle is not None:
+        local_entry = {
+            "tp_rank": tp_rank,
+            "remote_name": local_bundle.remote_name,
+            "agent_metadata_b64": _b64.b64encode(
+                local_bundle.agent_desc
+            ).decode("ascii"),
+            "pool_base_ptr": local_bundle.pool_base_ptr,
+            "pool_size_bytes": local_bundle.pool_size_bytes,
+            "source_generation": local_bundle.source_generation,
+        }
 
     if tp_size <= 1:
-        return [local_entry]
+        return [local_entry] if local_entry is not None else None
 
-    # MPI allgather — every rank gets the full list.
-    all_entries = mpi_allgather(local_entry)
-    # Sort by tp_rank so indexing is deterministic.
-    all_entries.sort(key=lambda e: e["tp_rank"])
+    from .remote_g2_group import TPGroup
+
+    # Build the group from the live MPI world so the collective can scope itself
+    # to this rank's TP subgroup under attention-DP (where world > tp_size). The
+    # entry is keyed by the TP-local rank (the value the target worker indexes by
+    # via its own DP-aware TPGroup), not the world rank.
+    try:
+        from tensorrt_llm._utils import mpi_rank, mpi_world_size
+
+        world_rank = int(mpi_rank())
+        world_size = int(mpi_world_size())
+    except Exception:
+        world_rank, world_size = tp_rank, tp_size
+    group = TPGroup(
+        world_rank=world_rank,
+        world_size=max(world_size, tp_size),
+        local_rank=(world_rank % tp_size) if tp_size > 0 else world_rank,
+        tp_size=tp_size,
+    )
+    all_ok, entries = group.agree_tp_subgroup(
+        local_entry, ok=local_entry is not None
+    )
+    if not all_ok:
+        raise RuntimeError(
+            "remote_g2: S1 startup aborted — not every TP rank could build a "
+            "NIXL source bundle; remote-G2 transfer cannot be enabled "
+            "consistently across the TP group"
+        )
+    # Every entry is a real contribution when all_ok; sort for deterministic
+    # per-rank indexing.
+    entries = sorted(entries, key=lambda e: e["tp_rank"])
 
     logging.warning(
         "remote_g2: S1 per-rank NIXL metadata gathered: tp_size=%d "
         "ranks=[%s]",
         tp_size,
-        ", ".join(
-            f"{e['tp_rank']}:{e['remote_name']}" for e in all_entries
-        ),
+        ", ".join(f"{e['tp_rank']}:{e['remote_name']}" for e in entries),
     )
-    return all_entries
+    return entries
 
 
 def _result_to_dict(result: Any) -> dict:
@@ -177,18 +209,31 @@ def _ipc_socket_path(dynamo_pid: int, tp_rank: int = 0, tp_size: int = 1) -> str
     return f"/tmp/dynamo_remote_g2_ipc_{dynamo_pid}_tp{tp_rank}.sock"
 
 
+# Intra-pod sibling resolve RPC timeout. Kept short so one slow/dead sibling
+# can stall the single-threaded REP loop for at most this long per sibling
+# rather than the previous 5s.
+_SIBLING_RPC_TIMEOUT_MS = 2000
+
+
 def _query_sibling_rank(
     dynamo_pid: int,
     sibling_rank: int,
     tp_size: int,
     block_hashes: list[int],
     lease_id: Optional[str] = None,
+    socket_cache: Optional[dict] = None,
 ) -> list[dict]:
     """Query a sibling TP rank's ZMQ REP for descriptors via intra-pod IPC.
 
     Returns a list of descriptor dicts (one per block_hash, None entries
     for blocks not found on that rank). Sub-millisecond — Unix domain
     socket on the same pod.
+
+    When ``socket_cache`` is provided, the REQ socket is reused across calls
+    (keyed by sibling rank) instead of being created and torn down per query.
+    A REQ socket that errors/times out is left in an unusable state by ZMQ's
+    strict send/recv FSM, so on any failure the socket is closed and evicted
+    from the cache; the next call rebuilds a fresh one.
 
     The sibling pins each block it resolves (find-and-pin lookup). The
     lease_id is threaded through so the sibling can register those pins
@@ -197,12 +242,17 @@ def _query_sibling_rank(
     import zmq
 
     sibling_path = _ipc_socket_path(dynamo_pid, sibling_rank, tp_size)
-    ctx = zmq.Context.instance()
-    req = ctx.socket(zmq.REQ)
-    req.RCVTIMEO = 5000
-    req.SNDTIMEO = 5000
+    req = socket_cache.get(sibling_rank) if socket_cache is not None else None
     try:
-        req.connect(f"ipc://{sibling_path}")
+        if req is None:
+            ctx = zmq.Context.instance()
+            req = ctx.socket(zmq.REQ)
+            req.RCVTIMEO = _SIBLING_RPC_TIMEOUT_MS
+            req.SNDTIMEO = _SIBLING_RPC_TIMEOUT_MS
+            req.setsockopt(zmq.LINGER, 0)
+            req.connect(f"ipc://{sibling_path}")
+            if socket_cache is not None:
+                socket_cache[sibling_rank] = req
         req.send(pickle.dumps({
             "method": "resolve_hashes",
             "payload": {"block_hashes": block_hashes, "lease_id": lease_id},
@@ -221,9 +271,21 @@ def _query_sibling_rank(
             "remote_g2: sibling rank %d IPC query failed (path=%s)",
             sibling_rank, sibling_path,
         )
+        # The REQ socket is now in a broken state; drop it so the next query
+        # rebuilds a fresh, reusable one.
+        if req is not None:
+            try:
+                req.close(linger=0)
+            except Exception:
+                pass
+        if socket_cache is not None:
+            socket_cache.pop(sibling_rank, None)
         return []
     finally:
-        req.close()
+        # Only close per-call when not pooling; pooled sockets stay open for
+        # reuse (and are closed above on error).
+        if socket_cache is None and req is not None:
+            req.close()
 
 
 def _descs_from_records(records: list) -> list:
@@ -293,6 +355,10 @@ def _start_zmq_rep_service(
             daemon=True,
         ).start()
 
+    # Persistent per-sibling REQ sockets reused across resolves. Only rank 0's
+    # _loop thread touches this, so no lock is needed.
+    sibling_socket_cache: dict = {}
+
     def _loop() -> None:
         while True:
             method = "<unparsed>"
@@ -305,10 +371,12 @@ def _start_zmq_rep_service(
                 req = pickle.loads(raw)
                 method = req.get("method")
                 payload = req.get("payload") or {}
-                # Lazy TTL sweep on the request path so active ranks reclaim
-                # promptly without waiting for the background sweeper tick.
-                registry.expire_sibling_pins()
                 if method == "resolve_hashes":
+                    # Lazy TTL sweep on the resolve path so active ranks reclaim
+                    # promptly without waiting for the background sweeper tick.
+                    # (Only the resolve methods touch sibling pins; skip it on
+                    # get_metadata / release_lease.)
+                    registry.expire_sibling_pins()
                     # Intra-pod query from rank 0: look up the whole prefix on
                     # THIS rank's registry in one batched find-and-pin call and
                     # return descriptors. Each hit is pinned; register the pins
@@ -324,6 +392,7 @@ def _start_zmq_rep_service(
                         )
                     response = {"ok": True, "result": _descs_from_records(records)}
                 elif method == "resolve_and_lease":
+                    registry.expire_sibling_pins()
                     result = registry.resolve_and_lease(payload.get("plan"))
                     result_dict = _result_to_dict(result)
 
@@ -352,6 +421,7 @@ def _start_zmq_rep_service(
                             sibling_descs = _query_sibling_rank(
                                 dynamo_pid, sibling, tp_size, block_hashes,
                                 lease_id=result.lease_id,
+                                socket_cache=sibling_socket_cache,
                             )
                             if sibling_descs:
                                 per_rank_descs[sibling] = sibling_descs
@@ -683,112 +753,6 @@ def _setup_nixl_source_agent(
     )
 
 
-# ─── S2: Per-rank descriptor gather on resolve ─────────────────────
-#
-# When TP>1, each rank holds its own slice of every KV block. On a
-# resolve RPC, rank 0 must gather per-rank descriptors from all TP
-# siblings so the target can issue per-rank NIXL READs.
-
-# Sentinel values for the sibling resolve loop (S3).
-_SIBLING_RESOLVE_TAG = "__remote_g2_resolve_hashes__"
-_SIBLING_SHUTDOWN_TAG = "__remote_g2_shutdown__"
-
-
-def _gather_per_rank_descriptors(
-    block_hashes: list[int],
-    local_registry: "SourceG2DescriptorRegistry",
-    tp_size: int,
-) -> dict[int, list[dict]]:
-    """S2: Rank 0 broadcasts block hashes, all ranks do local lookup,
-    rank 0 gathers per-rank descriptor lists.
-
-    Returns {tp_rank: [descriptor_dict, ...]} where each descriptor_dict
-    has keys matching the flat descriptor format (byte_offset, byte_length,
-    pool_id, block_hash, etc.).
-
-    For TP=1, returns {0: [local descriptors]}.
-    """
-    from tensorrt_llm._utils import mpi_allgather, mpi_broadcast
-
-    # Broadcast hashes from rank 0 to all ranks.
-    hashes = mpi_broadcast(block_hashes, root=0)
-
-    # Each rank resolves locally using its own registry. We use the
-    # internal find-and-pin path to get descriptors without creating
-    # a lease (the lease is managed by rank 0's resolve_and_lease).
-    local_descs = _descs_from_records(
-        local_registry.find_and_pin_descriptor_records(hashes)
-    )
-
-    # Gather from all ranks. Each rank contributes its descriptor list.
-    from tensorrt_llm._utils import mpi_rank
-    all_rank_descs = mpi_allgather({"tp_rank": mpi_rank(), "descs": local_descs})
-
-    # Assemble into {rank: descs} dict.
-    per_rank = {}
-    for entry in all_rank_descs:
-        per_rank[entry["tp_rank"]] = entry["descs"]
-
-    return per_rank
-
-
-def _start_sibling_rank_resolve_loop(
-    kv: Any,
-    registry: "SourceG2DescriptorRegistry",
-    tp_rank: int,
-    tp_size: int,
-) -> None:
-    """S3: Non-rank-0 TP siblings run a background thread that
-    participates in MPI collectives during resolve RPCs.
-
-    The loop blocks on mpi_broadcast (waiting for rank 0 to send
-    block hashes), does local findAndPinSecondaryBlockByHash, then
-    participates in the mpi_allgather back to rank 0.
-
-    Runs as a daemon thread so it doesn't block process shutdown.
-    """
-
-    def _loop():
-        from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
-
-        logging.info(
-            "remote_g2: S3 sibling resolve loop started on tp_rank=%d",
-            tp_rank,
-        )
-        while True:
-            try:
-                # Block until rank 0 broadcasts hashes (or shutdown).
-                hashes = mpi_broadcast(None, root=0)
-
-                if hashes == _SIBLING_SHUTDOWN_TAG:
-                    logging.info(
-                        "remote_g2: S3 sibling loop shutdown on tp_rank=%d",
-                        tp_rank,
-                    )
-                    return
-
-                # Local resolve for the whole prefix in one batched call.
-                local_descs = _descs_from_records(
-                    registry.find_and_pin_descriptor_records(hashes)
-                )
-
-                # Participate in the gather back to rank 0.
-                mpi_allgather({
-                    "tp_rank": mpi_rank(),
-                    "descs": local_descs,
-                })
-
-            except Exception:
-                logging.exception(
-                    "remote_g2: S3 sibling resolve loop error on tp_rank=%d",
-                    tp_rank,
-                )
-                # Don't exit on transient errors — keep looping.
-
-    t = threading.Thread(target=_loop, daemon=True, name=f"g2-sibling-{tp_rank}")
-    t.start()
-
-
 def maybe_start_remote_g2_service(
     kv: Any,
     *,
@@ -942,21 +906,29 @@ def maybe_start_remote_g2_service(
     # secondary pool. Each TP rank builds its own agent with a rank-
     # qualified name. The bundle is stashed as a process-wide singleton
     # so the ZMQ REP service can answer the get_metadata RPC (Stage T2).
+    global _GLOBAL_NIXL_SOURCE_BUNDLE, _GLOBAL_PER_RANK_NIXL_BUNDLES
     pool_size_bytes = _pool_size_bytes(kv)
+    bundle: Optional[_NixlSourceBundle] = None
     if not pool_size_bytes or pool_size_bytes <= 0:
         logging.warning(
             "remote_g2: NIXL agent skipped (pool_size_bytes unknown)"
         )
     else:
-        bundle = _setup_nixl_source_agent(
-            pool_base_ptr=pool_base_ptr,
-            pool_size_bytes=pool_size_bytes,
-            source_worker_id=source_worker_id,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-        )
+        # A bootstrap raise must not let one rank skip the S1 collective below
+        # while its siblings enter it; collapse any failure to bundle=None so
+        # the group decision stays symmetric.
+        try:
+            bundle = _setup_nixl_source_agent(
+                pool_base_ptr=pool_base_ptr,
+                pool_size_bytes=pool_size_bytes,
+                source_worker_id=source_worker_id,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+            )
+        except Exception:
+            logging.exception("remote_g2: NIXL source agent bootstrap raised")
+            bundle = None
         if bundle is not None:
-            global _GLOBAL_NIXL_SOURCE_BUNDLE
             _GLOBAL_NIXL_SOURCE_BUNDLE = bundle
             logging.warning(
                 "remote_g2: source NIXL agent built: agent_name=%s "
@@ -966,25 +938,20 @@ def maybe_start_remote_g2_service(
                 bundle.pool_size_bytes,
                 tp_rank,
             )
-
-            # S1 — gather per-rank NIXL metadata from all TP siblings.
-            # Every rank must participate (MPI allgather is collective).
-            try:
-                global _GLOBAL_PER_RANK_NIXL_BUNDLES
-                _GLOBAL_PER_RANK_NIXL_BUNDLES = (
-                    _gather_per_rank_nixl_metadata(
-                        bundle, tp_rank=tp_rank, tp_size=tp_size,
-                    )
-                )
-            except Exception:
-                logging.exception(
-                    "remote_g2: S1 per-rank metadata gather failed"
-                )
         else:
             logging.warning(
                 "remote_g2: NIXL source agent bootstrap failed; "
                 "resolve will still work, but transfer is disabled"
             )
+
+    # S1 — exchange per-rank NIXL metadata symmetrically. Every rank reaches
+    # this call regardless of whether its own bundle built, so a one-sided
+    # skip can never deadlock the collective. Under TP>1 a missing bundle on
+    # any rank raises identically on all ranks (hard-fail). Allowed to
+    # propagate so a misconfigured transfer group fails loudly at startup.
+    _GLOBAL_PER_RANK_NIXL_BUNDLES = _gather_per_rank_nixl_metadata(
+        bundle, tp_rank=tp_rank, tp_size=tp_size,
+    )
 
     # Per-rank resolve is now handled via intra-pod ZMQ IPC (no MPI).
     # Each rank's ZMQ REP serves resolve_hashes queries from rank 0.

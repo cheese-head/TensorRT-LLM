@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -18,9 +19,10 @@ from .remote_g2 import (
     RemoteKvReusePlan,
     TargetRemoteG2BindingStore,
     TargetRemotePlanStore,
+    _normalize_request_id,
     target_remote_g2_plan_store,
 )
-from .remote_g2_group import LoadStatus, RankScope
+from .remote_g2_group import LoadStatus, TPGroup
 from .remote_g2_observability import (
     NullRemoteG2ObservabilitySink,
     RemoteG2LifecycleEvent,
@@ -132,6 +134,43 @@ def _resolve_release_lease(explicit: Optional[Callable[[str, str], bool]]):
     return _call
 
 
+class _BoundedKeySet:
+    """Insertion-ordered set with a hard size cap; evicts the oldest entry on
+    overflow.
+
+    Used for the worker's per-request dedup state (``_completed_loads``,
+    ``_released_leases``). The only consumers of these entries are requests
+    still being emitted by the scheduler, which are always recent; request ids
+    increase monotonically and a finished request is never re-emitted. Evicting
+    ids far older than any in-flight load is therefore safe, and the cap keeps
+    the state from growing without bound on a long-running server (the worker
+    has no per-request finish hook of its own).
+    """
+
+    __slots__ = ("_max", "_items")
+
+    def __init__(self, max_size: int = 16384) -> None:
+        self._max = max_size
+        self._items: "OrderedDict[Any, None]" = OrderedDict()
+
+    def add(self, key: Any) -> None:
+        if key in self._items:
+            self._items.move_to_end(key)
+            return
+        self._items[key] = None
+        if len(self._items) > self._max:
+            self._items.popitem(last=False)
+
+    def discard(self, key: Any) -> None:
+        self._items.pop(key, None)
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
 class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
     requires_retryable_kv_admission = True
     # KVCM V1 local offload/onboard is not safe under overlap scheduler.
@@ -167,6 +206,13 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
                 observability=self._observability,
             )
         )
+        # Request ids whose transfer-ready binding has already been emitted in
+        # connector metadata. A binding only needs to reach the worker once —
+        # the worker tracks _active_loads / _completed_loads and never re-issues
+        # a transfer for an id it has already seen — so re-emitting it every
+        # tick only inflates the per-tick MPI broadcast of build_connector_meta.
+        # Cleared in request_finished, so it is bounded by concurrent requests.
+        self._emitted_transfer_ready: set[int | str] = set()
 
     @property
     def _resolve_and_lease(
@@ -211,15 +257,24 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
         # and the worker tracks per-request _active_loads / _completed_loads
         # to avoid double-start, so we don't actually need scheduler_output
         # to dedupe.
+        #
+        # Emit each transfer-ready binding exactly once: a binding stays BOUND
+        # (and thus transfer-ready) until request_finished, so without this
+        # guard every still-running request's record would be re-included and
+        # re-broadcast over MPI on every tick for the life of the request.
         bindings: list[RemoteG2BindingRecord] = []
-        for request_id, record in self._binding_store.iter_records():
-            if record.is_transfer_ready:
+        for _request_id, record in self._binding_store.iter_records():
+            if record.is_transfer_ready and (
+                record.request_id not in self._emitted_transfer_ready
+            ):
                 bindings.append(record)
+                self._emitted_transfer_ready.add(record.request_id)
         return RemoteG2ConnectorMetadata(tuple(bindings))
 
     def request_finished(self, request: Any, cache_block_ids: list[int]) -> bool:
         self._binding_store.discard(request.request_id, "request_finished")
         self._plan_store.discard(request.request_id)
+        self._emitted_transfer_ready.discard(_normalize_request_id(request.request_id))
         return False
 
 
@@ -255,12 +310,17 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         self._transfer_timeout_ms = transfer_timeout_ms
         self._observability = observability or NullRemoteG2ObservabilitySink()
         self._active_loads: dict[int | str, _RemoteG2ActiveLoad] = {}
-        self._completed_loads: set[int | str] = set()
-        self._released_leases: set[str] = set()
+        # Bounded dedup state: a completed load must not be re-started if the
+        # scheduler's (possibly stale) metadata still carries its binding, and a
+        # lease must not be released twice. The worker has no per-request finish
+        # hook, so these are size-capped rather than cleared per request — see
+        # _BoundedKeySet. Only in-flight (recent) requests are ever looked up.
+        self._completed_loads = _BoundedKeySet()
+        self._released_leases = _BoundedKeySet()
         # TP rank group. Under TP>1 every rank issues its own NIXL transfer for
         # a request; get_finished uses this to make failure a group decision so
         # a transfer error on any rank tears the load down on all ranks.
-        self._scope = RankScope.detect(llm_args)
+        self._tp_group = TPGroup.detect(llm_args)
         # Requests that may still need group reconciliation. Seeded from the
         # scheduler's started_loading_req_ids and trimmed only by the group
         # collective's output, so it is identical on every rank — that lets
@@ -297,16 +357,22 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         metadata = self.get_connector_meta()
         if not isinstance(metadata, RemoteG2ConnectorMetadata) or not metadata.bindings:
             return
+        # A missing transfer adapter is a supported, non-fatal state: the target
+        # setup deliberately leaves it uninstalled when the NIXL build fails
+        # ("resolve still works, transfer disabled"). Surface the affected
+        # blocks for local recompute and return — never raise into the executor
+        # loop, which would take the whole engine down.
         if self._transfer_adapter is None:
             for record in metadata.bindings:
-                self._emit_record_event(
-                    "fallback",
-                    record,
-                    reason="transfer_adapter_missing",
-                    outcome="local_recompute",
-                )
-                self._release_record_once(record, "transfer_adapter_missing")
-            raise RuntimeError("remote G2 transfer adapter is not configured")
+                self._fallback_record(record, "transfer_adapter_missing")
+            return
+
+        # Hand the adapter this rank's TP-local index from the single
+        # authoritative (DP-aware) TPGroup, so its per-rank descriptor
+        # indexing matches the worker's topology instead of re-detecting it.
+        bind_local_rank = getattr(self._transfer_adapter, "bind_local_rank", None)
+        if bind_local_rank is not None:
+            bind_local_rank(self._tp_group.local_rank)
 
         for record in metadata.bindings:
             request_id = record.request_id
@@ -314,18 +380,34 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
                 continue
             try:
                 result = self._transfer_adapter.start_transfer(record)
-            except Exception as exc:
-                self._emit_record_event(
-                    "fallback",
-                    record,
-                    reason="transfer_start_failed",
-                    outcome="local_recompute",
+            except Exception:
+                # A failed start falls back to local recompute for THIS record
+                # (blocks recorded, lease released) and continues with the rest;
+                # it must not abort the whole batch or raise into the executor.
+                import logging as _logging
+                _logging.exception(
+                    "remote_g2: transfer failed to start (request=%s)", request_id
                 )
-                self._release_record_once(record, "transfer_start_failed")
-                raise RuntimeError("remote G2 transfer failed to start") from exc
+                self._fallback_record(record, "transfer_start_failed")
+                continue
             self._active_loads[request_id] = _RemoteG2ActiveLoad(
                 result=result, started_at_ms=_now_ms()
             )
+
+    def _fallback_record(self, record: RemoteG2BindingRecord, reason: str) -> None:
+        """Degrade a record to local recompute: surface its target blocks via
+        get_block_ids_with_load_errors() and release the lease once. Used by the
+        start_load_kv failure paths so a transfer that can't start never hangs
+        the request (which is suspended awaiting get_finished) and never raises.
+        """
+        self._record_failed_blocks(record)
+        self._emit_record_event(
+            "fallback",
+            record,
+            reason=reason,
+            outcome="local_recompute",
+        )
+        self._release_record_once(record, reason)
 
     def wait_for_layer_load(self, layer_idx: int, stream: Any) -> None:
         return
@@ -383,9 +465,9 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         self._coord_pending |= newly_started
 
         globally_failed: set[int | str] = set(local_failed.keys())
-        if self._scope.enabled and self._coord_pending:
+        if self._tp_group.enabled and self._coord_pending:
             globally_active: set[int | str] = set()
-            for entry in self._scope.allgather(
+            for entry in self._tp_group.allgather(
                 {
                     "failed": list(local_failed.keys()),
                     "active": list(self._active_loads.keys()),
@@ -429,7 +511,7 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         # decision. _complete_success emits the appropriate event and releases
         # the record on its own failure paths, so here we just surface the
         # blocks for recompute and drop the load without raising.
-        finished_loading: list[int] = []
+        finished_loading: list[int | str] = []
         for request_id in local_done:
             if request_id in globally_failed:
                 continue
@@ -452,7 +534,10 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
                 continue
             self._active_loads.pop(request_id, None)
             self._completed_loads.add(request_id)
-            finished_loading.append(int(request_id))
+            # Return the id with its native type. _active_loads is keyed by
+            # int|str (request ids may be non-numeric strings); int()-casting
+            # here would raise inside the one method that must never raise.
+            finished_loading.append(request_id)
         return ([], finished_loading)
 
     def _poll_status(
@@ -496,6 +581,7 @@ class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
         completed (and were moved out of _active_loads).
         """
         active = self._active_loads.pop(request_id, None)
+        self._completed_loads.discard(request_id)
         if active is None:
             return
         result = active.result

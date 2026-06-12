@@ -9,7 +9,7 @@ and the request only succeeds when all ranks succeed. Failure, abort, and
 rank-to-peer indexing therefore have to be reasoned about at the level of the
 rank group, not the individual rank.
 
-`RankScope` is the one place that owns that group: which rank am I (TP-local,
+`TPGroup` is the one place that owns that group: which rank am I (TP-local,
 DP-aware), how big is the group, and how do I reduce a per-rank value across
 it. Keeping this in a single object means the worker's failure coordination,
 the adapter's per-rank descriptor indexing, and any future sibling fan-out all
@@ -59,7 +59,7 @@ def _tp_size_from_llm_args(llm_args: Any) -> Optional[int]:
 
 
 @dataclass
-class RankScope:
+class TPGroup:
     """Topology + collective transport for one TP rank group.
 
     ``local_rank`` is the TP-local rank (equal to the MPI world rank when
@@ -98,14 +98,72 @@ class RankScope:
 
         return list(mpi_allgather(value))
 
+    def agree(self, value: Any, *, ok: bool) -> tuple[bool, list]:
+        """Symmetric collective: every rank contributes, none may skip.
+
+        ``ok=False`` is how a rank reports "I could not produce a value"
+        *without* skipping the collective — the call is unconditional, so a
+        rank that failed locally can never leave its siblings blocked in the
+        allgather (the one-sided-entry deadlock class).
+
+        Returns ``(all_ranks_ok, [value_per_rank...])``. When ``all_ranks_ok``
+        is True every entry is a real contribution; otherwise callers should
+        make a consistent group decision (all ranks see the same flag, so any
+        raise/fallback they take is symmetric). Single-rank deployments return
+        ``(ok, [value])`` with no MPI call.
+        """
+        gathered = self.allgather({"ok": bool(ok), "value": value})
+        all_ok = all(entry.get("ok", False) for entry in gathered)
+        return all_ok, [entry.get("value") for entry in gathered]
+
+    def agree_tp_subgroup(self, value: Any, *, ok: bool) -> tuple[bool, list]:
+        """Like :meth:`agree`, but the allgather is scoped to *this rank's TP
+        subgroup* rather than the whole MPI world.
+
+        Under attention-DP the world spans several TP groups. Gathering per-rank
+        data across the whole world then keying it by TP-local rank aliases the
+        groups (two ranks share a ``tp_rank``), which silently mixes one DP
+        group's source-pool pointers into another's. Splitting
+        ``MPI_COMM_WORLD`` on ``color = world_rank // tp_size`` confines the
+        exchange to a single TP group, so the per-rank keying is unambiguous.
+
+        Degrades to :meth:`agree` (full-world or identity) when an allgather is
+        injected (tests), for a single rank, or when the subgroup already equals
+        the world (DP off: ``tp_size >= world_size``). Like :meth:`agree`, every
+        world rank MUST call this — ``Split`` is collective over the world, so a
+        one-sided skip would deadlock.
+
+        Returns ``(all_ranks_ok, [value_per_rank...])`` over the subgroup.
+        """
+        if (
+            self._allgather is not None
+            or not self.enabled
+            or self.tp_size <= 1
+            or self.tp_size >= self.world_size
+        ):
+            return self.agree(value, ok=ok)
+
+        from tensorrt_llm._utils import mpi_comm
+
+        comm = mpi_comm()
+        # key=world_rank keeps the subgroup ordered by world rank; color groups
+        # the tp_size contiguous ranks that form one TP group.
+        sub = comm.Split(self.world_rank // self.tp_size, self.world_rank)
+        try:
+            gathered = list(sub.allgather({"ok": bool(ok), "value": value}))
+        finally:
+            sub.Free()
+        all_ok = all(entry.get("ok", False) for entry in gathered)
+        return all_ok, [entry.get("value") for entry in gathered]
+
     @classmethod
     def detect(
         cls,
         llm_args: Any = None,
         *,
         allgather: Optional[Callable[[Any], list]] = None,
-    ) -> "RankScope":
-        """Build a RankScope from the live MPI environment.
+    ) -> "TPGroup":
+        """Build a TPGroup from the live MPI environment.
 
         Falls back to a trivial single-rank scope if MPI is unavailable, so the
         connector never fails to construct in a non-distributed context.
@@ -116,7 +174,7 @@ class RankScope:
             world_rank = int(mpi_rank())
             world_size = int(mpi_world_size())
         except Exception:
-            logging.debug("remote_g2: RankScope.detect MPI unavailable; size=1")
+            logging.debug("remote_g2: TPGroup.detect MPI unavailable; size=1")
             return cls(
                 world_rank=0,
                 world_size=1,
@@ -142,20 +200,3 @@ class RankScope:
             tp_size=tp_size,
             _allgather=allgather,
         )
-
-
-# Cached process-wide scope for callers that only need the local rank (e.g. the
-# transfer adapter indexing per-rank descriptors) and have no llm_args handle.
-_cached_scope: Optional[RankScope] = None
-
-
-def current_local_rank() -> int:
-    """TP-local rank of this process, cached after first detection.
-
-    Equivalent to ``mpi_rank()`` when attention-DP is off; routes through
-    RankScope so per-rank indexing has a single source of truth.
-    """
-    global _cached_scope
-    if _cached_scope is None:
-        _cached_scope = RankScope.detect()
-    return _cached_scope.local_rank

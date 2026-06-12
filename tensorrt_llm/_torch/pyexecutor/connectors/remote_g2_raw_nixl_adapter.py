@@ -176,6 +176,12 @@ class RawNixlRemoteG2Adapter:
         self._target_descriptor_resolver = target_descriptor_resolver
         self._device_id = int(device_id)
         self._block_size_bytes = 0  # set on first transfer
+        # TP-local rank used to index per-rank source metadata/descriptors.
+        # The worker owns the authoritative (DP-aware) TPGroup and injects the
+        # rank via bind_local_rank(); the adapter never re-detects topology
+        # itself. Defaults to 0 so the TP=1 path (empty per-rank dicts) works
+        # before any bind.
+        self._local_rank = 0
 
         # Pre-register the entire primary VRAM pool — sub-gap "Buffer
         # pre-registration lifecycle" calls this out as required. The
@@ -202,10 +208,48 @@ class RawNixlRemoteG2Adapter:
             raise
 
         # Per-peer prepped-dlist handles. Keyed by (source_agent_name,
-        # source_generation). The local dlist is also cached per-peer
-        # because NIXL's make_prepped_xfer requires both local and
-        # remote handles to come from prep_xfer_dlist.
+        # source_generation): only the *remote* dlist is peer-specific.
         self._peer_handles: dict[tuple[str, int], tuple[Any, Any]] = {}
+        # The local dlist covers our own primary pool and is identical for every
+        # peer, so it is built once (on the first transfer, when block_size is
+        # known) and reused — building it per peer re-materialized a tuple per
+        # pool block (tens/hundreds of thousands) on each peer's first transfer.
+        self._local_handle: Optional[Any] = None
+
+    def bind_local_rank(self, local_rank: int) -> None:
+        """Set the TP-local rank used to index per-rank source metadata and
+        descriptors. Called by the worker, which owns the single authoritative
+        (DP-aware) TPGroup, so the adapter never detects topology itself."""
+        self._local_rank = int(local_rank)
+
+    def _get_local_handle(self) -> Any:
+        """Build (once) and return the prepped local dlist over our entire
+        primary VRAM pool, indexed by block. The local pool is the same for
+        every peer, so the handle is cached and reused across peers instead of
+        rebuilt per peer.
+
+        NIXL distinguishes local vs remote dlists by agent_name: empty string =
+        local, non-empty = remote. Passing our own name for the local side fails
+        with "invalid sides" at make_prepped_xfer time.
+        """
+        if self._local_handle is not None:
+            return self._local_handle
+        block_size = self._block_size_bytes
+        num_blocks = self._primary_pool_size_bytes // block_size if block_size else 0
+        local_descs = [
+            (
+                self._primary_pool_base_ptr + i * block_size,
+                block_size,
+                self._device_id,
+            )
+            for i in range(num_blocks)
+        ]
+        self._local_handle = self._agent.prep_xfer_dlist(
+            "",  # local
+            local_descs,
+            mem_type="VRAM",
+        )
+        return self._local_handle
 
     def _ensure_peer_loaded(
         self,
@@ -239,28 +283,10 @@ class RawNixlRemoteG2Adapter:
                 loaded_name, peer_name,
             )
 
-        # Local dlist: covers our entire primary VRAM pool, indexed by
-        # block. We pre-built block-aligned tuples so make_prepped_xfer's
-        # index lookup is a 1:1 block_id-to-slot mapping.
+        # Local dlist: covers our entire primary VRAM pool, indexed by block.
+        # Identical for every peer, so build/cache once (see _get_local_handle).
         block_size = self._block_size_bytes
-        num_blocks = self._primary_pool_size_bytes // block_size if block_size else 0
-        local_descs = [
-            (
-                self._primary_pool_base_ptr + i * block_size,
-                block_size,
-                self._device_id,
-            )
-            for i in range(num_blocks)
-        ]
-        # NIXL distinguishes local vs remote dlists by agent_name:
-        # empty string = local, non-empty = remote. Passing our own
-        # name for local fails with "invalid sides (local must be
-        # local, remote must be remote)" at make_prepped_xfer time.
-        local_handle = self._agent.prep_xfer_dlist(
-            "",  # local
-            local_descs,
-            mem_type="VRAM",
-        )
+        local_handle = self._get_local_handle()
 
         # Remote dlist: covers the source's host_pinned pool, also
         # block-aligned. The source pool base + size came back in the
@@ -321,10 +347,10 @@ class RawNixlRemoteG2Adapter:
         # T3: Determine which source rank's metadata to use.
         # With TP>1, each target rank loads its corresponding source
         # rank's NIXL agent and uses that rank's descriptors. The TP-local
-        # rank (DP-aware) comes from the shared RankScope so peer indexing
-        # has a single source of truth instead of a raw mpi_rank() call.
-        from .remote_g2_group import current_local_rank
-        my_rank = current_local_rank()
+        # rank (DP-aware) is injected by the worker (bind_local_rank) from the
+        # single authoritative TPGroup, so peer indexing never re-detects
+        # topology here.
+        my_rank = self._local_rank
 
         resolve_result = record.resolve_result
         per_rank_meta = getattr(resolve_result, "per_rank_source_metadata", {})

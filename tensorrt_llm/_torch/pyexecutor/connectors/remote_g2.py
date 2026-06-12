@@ -977,12 +977,29 @@ class SourceG2DescriptorRegistry:
                 kv_hash = int(kv_hashes[i])
                 record = self._records.get(kv_hash)
                 if record is None and self._kv is not None:
-                    lookup_results = self._find_and_pin_blocks_by_hash(kv_hashes[i:])
+                    # Batch-look-up only the contiguous run of hashes that are
+                    # NOT already cached in _records. Stopping at the next
+                    # cached hash keeps the per-hash handling below
+                    # authoritative for cached records and avoids pinning a
+                    # block _records already holds — the double-pin the old
+                    # "look up the whole suffix and break" path could hit if a
+                    # later block was cached while an earlier one was not
+                    # (prefix-monotonicity violation).
+                    run_end = i
+                    while (
+                        run_end < len(kv_hashes)
+                        and int(kv_hashes[run_end]) not in self._records
+                    ):
+                        run_end += 1
+                    lookup_results = self._find_and_pin_blocks_by_hash(
+                        kv_hashes[i:run_end]
+                    )
                     if not lookup_results:
                         per_block_status.append(
                             RemoteG2BlockStatus(int(identity_hash), "missing")
                         )
                         break
+                    hit_miss = False
                     for offset, lookup_result in enumerate(lookup_results):
                         current_identity_hash = int(identity_hashes[i + offset])
                         if isinstance(lookup_result, CacheMiss):
@@ -994,6 +1011,7 @@ class SourceG2DescriptorRegistry:
                             per_block_status.append(
                                 RemoteG2BlockStatus(current_identity_hash, status)
                             )
+                            hit_miss = True
                             break
                         record = self._record_from_pinned_cache_block(lookup_result)
                         records.append(record)
@@ -1004,7 +1022,14 @@ class SourceG2DescriptorRegistry:
                                 record.descriptor_generation,
                             )
                         )
-                    break
+                    if hit_miss:
+                        break
+                    # Every hash in the run resolved live. Advance past them;
+                    # if the run stopped early because the next hash is already
+                    # cached, the loop resumes on that cached record via the
+                    # normal path below instead of re-pinning it.
+                    i += len(lookup_results)
+                    continue
                 if record is None:
                     per_block_status.append(RemoteG2BlockStatus(int(identity_hash), "missing"))
                     break

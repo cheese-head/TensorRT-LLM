@@ -39,6 +39,14 @@ _REMOTE_G2_OBSERVABILITY_PATH = (
     / "connectors"
     / "remote_g2_observability.py"
 )
+_REMOTE_G2_GROUP_PATH = (
+    _ROOT
+    / "tensorrt_llm"
+    / "_torch"
+    / "pyexecutor"
+    / "connectors"
+    / "remote_g2_group.py"
+)
 
 ROADMAP_FAILURE_SET = {
     "stale_router_event",
@@ -107,6 +115,9 @@ def _load_connector_modules():
     transfer = _load_module(
         f"{_CONNECTOR_PACKAGE}.remote_g2_transfer", _REMOTE_G2_TRANSFER_PATH
     )
+    _load_module(
+        f"{_CONNECTOR_PACKAGE}.remote_g2_group", _REMOTE_G2_GROUP_PATH
+    )
     connector = _load_module(
         f"{_CONNECTOR_PACKAGE}.remote_g2_connector", _REMOTE_G2_CONNECTOR_PATH
     )
@@ -127,6 +138,19 @@ compute_remote_g2_matched_tokens = REMOTE_G2.compute_remote_g2_matched_tokens
 RemoteG2NixlTransferAdapter = TRANSFER.RemoteG2NixlTransferAdapter
 RemoteG2SourceMetadata = TRANSFER.RemoteG2SourceMetadata
 RemoteG2TransferDescriptor = TRANSFER.RemoteG2TransferDescriptor
+
+
+@pytest.fixture(autouse=True)
+def _install_identity_slot_lookup():
+    """Production wires this up via maybe_start_remote_g2_target_client; these
+    tests construct TargetRemoteG2BindingStore directly and bypass that setup,
+    so without a stub bind_target_blocks fails with target_slot_lookup_failed
+    (leaving bound_blocks empty). Install an identity stub (slot_idx ==
+    block_id) for the test, restore the previous value after."""
+    saved = CONNECTOR._installed_block_id_to_slot_idx
+    CONNECTOR.install_block_id_to_slot_idx(lambda ids: list(ids))
+    yield
+    CONNECTOR._installed_block_id_to_slot_idx = saved
 
 
 class _FakeTransferResult:
@@ -530,8 +554,10 @@ def test_remote_g2_transfer_failure_and_timeout_release_once():
     )
     failure_worker.start_load_kv(None)
 
-    with pytest.raises(RuntimeError, match="failed closed"):
-        failure_worker.get_finished([], [1234])
+    # A poll-time transfer failure must NOT propagate into the executor loop;
+    # it falls back to local recompute (blocks reported) and releases once.
+    assert failure_worker.get_finished([], [1234]) == ([], [])
+    assert failure_worker.get_block_ids_with_load_errors() == [101, 102]
     assert failure_released == [("lease-failed", "transfer_failed")]
 
     timeout_released = []
@@ -553,8 +579,9 @@ def test_remote_g2_transfer_failure_and_timeout_release_once():
     )
     timeout_worker.start_load_kv(None)
 
-    with pytest.raises(RuntimeError, match="timed out"):
-        timeout_worker.get_finished([], [1234])
+    # A timeout likewise falls back rather than raising.
+    assert timeout_worker.get_finished([], [1234]) == ([], [])
+    assert timeout_worker.get_block_ids_with_load_errors() == [101, 102]
     assert timeout_released == [("lease-timeout", "transfer_timeout")]
 
 
@@ -585,8 +612,9 @@ def test_remote_g2_source_restart_metadata_mismatch_cleans_up_without_publicatio
         RemoteG2ConnectorMetadata(bindings=(_bound_record(lease_id="lease-restart"),))
     )
 
-    with pytest.raises(RuntimeError, match="failed to start"):
-        worker.start_load_kv(None)
+    # A transfer that cannot start (source generation mismatch) falls back to
+    # local recompute without raising into the executor loop.
+    worker.start_load_kv(None)
 
     assert agent.requests == []
     assert marked_valid == []
@@ -667,8 +695,9 @@ def test_remote_g2_observability_contract_covers_required_events_without_raw_add
         RemoteG2ConnectorMetadata(bindings=(_bound_record(lease_id="lease-failed"),))
     )
     failed_worker.start_load_kv(None)
-    with pytest.raises(RuntimeError, match="failed closed"):
-        failed_worker.get_finished([], [1234])
+    # Publication failure is fail-closed (emits a "failed" event) but is not
+    # propagated out of get_finished; the blocks fall back to recompute.
+    failed_worker.get_finished([], [1234])
 
     assert {
         "planned",
