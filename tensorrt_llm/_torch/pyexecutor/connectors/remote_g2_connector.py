@@ -173,9 +173,10 @@ class _BoundedKeySet:
 
 class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
     requires_retryable_kv_admission = True
-    # KVCM V1 local offload/onboard is not safe under overlap scheduler.
-    # See NVBug 6293536.
-    requires_disable_overlap_scheduler = True
+    # Attention-DP and non-uniform/linear attention windows are not validated
+    # with retryable remote-G2 admission yet. Overlap scheduler is allowed by
+    # the fine-grained KVCM admission path from PR #6.
+    requires_disable_overlap_scheduler = False
     requires_disable_attention_dp = True
     requires_uniform_attention_window = True
 
@@ -281,7 +282,7 @@ class RemoteG2KvCacheConnectorScheduler(KvCacheConnectorScheduler):
 class RemoteG2KvCacheConnectorWorker(KvCacheConnectorWorker):
     requires_retryable_kv_admission = True
     # Keep scheduler and worker capability flags aligned.
-    requires_disable_overlap_scheduler = True
+    requires_disable_overlap_scheduler = False
     requires_disable_attention_dp = True
     requires_uniform_attention_window = True
 

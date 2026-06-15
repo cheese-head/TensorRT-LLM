@@ -163,12 +163,12 @@ def make_kv_pin_callbacks(
 ]:
     """Build (acquire_pin, release_pin) callbacks for SourceG2DescriptorRegistry.
 
-    acquire_pin pins the block by id, validates the post-pin tier is the
-    secondary pool (G2), and rewrites the record's byte_offset and
-    nixl_memory_desc.ptr to reflect the authoritative post-pin slot. A block
-    that has migrated off the secondary tier between event emission and pin
-    acquisition is unpinned and rejected (caller's resolve attempt fails so
-    the peer can fall back to local recompute).
+    acquire_pin accepts only records produced by the live
+    find_and_pin_blocks_by_hash path. That path already checked radix-tree
+    visibility, pinned atomically, and captured the authoritative slot. Records
+    produced only from publisher events are intentionally rejected because
+    pinning by block id can bypass radix-tree visibility and lease a detached
+    block after scheduler admission has claimed it for reuse.
 
     release_pin unpins the block by id. Sentinel pin_refs (None, negative)
     are no-ops to tolerate failed-acquire records that left a placeholder.
@@ -191,31 +191,10 @@ def make_kv_pin_callbacks(
         if getattr(record, "_pinned_by_lookup", False):
             return block_id
 
-        # Fallback path for records produced outside of
-        # find_and_pin_descriptor_records (e.g. publisher-event-derived records
-        # that weren't pinned at lookup). Pin here for host-pinned records only.
-        locations = kv_cache_manager.pin_blocks_by_id([block_id])
-        if not locations:
-            raise RuntimeError(
-                f"pin_blocks_by_id returned no locations for block_id={block_id}"
-            )
-        slot_idx, cache_level = locations[0]
-        slot_idx = int(slot_idx)
-        cache_level = int(cache_level)
-
-        if cache_level != _SECONDARY_CACHE_LEVEL:
-            kv_cache_manager.unpin_blocks_by_id([block_id])
-            raise RuntimeError(
-                f"block_id={block_id} pinned on cache_level={cache_level}, "
-                f"expected {_SECONDARY_CACHE_LEVEL} (G2); refusing to serve"
-            )
-
-        record.byte_offset = slot_idx * block_size_bytes
-        nixl_desc = record.metadata.get("nixl_memory_desc")
-        if isinstance(nixl_desc, Mapping):
-            new_ptr = secondary_pool_base_ptr + record.byte_offset
-            record.metadata["nixl_memory_desc"] = {**nixl_desc, "ptr": new_ptr}
-        return block_id
+        raise RuntimeError(
+            "remote_g2: refusing to acquire a source pin by block id; "
+            "record was not produced by find_and_pin_blocks_by_hash"
+        )
 
     def release_pin(pin_ref: Optional[int]) -> None:
         if pin_ref is None:

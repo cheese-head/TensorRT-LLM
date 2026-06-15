@@ -5,7 +5,7 @@
 engine subprocess.
 
 The KV cache manager (and the C++ APIs we depend on - find_and_pin_blocks_by_hash,
-pin_blocks_by_id, get_secondary_pool_data) only exists in the engine
+get_secondary_pool_data) only exists in the engine
 subprocess that PyExecutor runs in. So the registry has to be built there.
 The connector worker's register_kv_caches hook is the natural anchor: it
 runs in that subprocess, right after the KV cache pool is allocated.
@@ -402,6 +402,8 @@ def _start_zmq_rep_service(
                         block_hashes = [
                             d.block_hash for d in result.descriptors
                         ]
+                        expected_ranks = set(range(tp_size))
+                        expected_blocks = len(block_hashes)
                         per_rank_descs = {tp_rank: [
                             {
                                 "block_hash": d.block_hash,
@@ -412,6 +414,7 @@ def _start_zmq_rep_service(
                             }
                             for d in result.descriptors
                         ]}
+                        incomplete_reason: Optional[str] = None
                         # Query each sibling rank via local ZMQ IPC. The
                         # lease_id lets each sibling register the pins it takes
                         # under that lease so they expire on the lease's TTL.
@@ -423,8 +426,53 @@ def _start_zmq_rep_service(
                                 lease_id=result.lease_id,
                                 socket_cache=sibling_socket_cache,
                             )
-                            if sibling_descs:
+                            if sibling_descs and len(sibling_descs) == expected_blocks:
                                 per_rank_descs[sibling] = sibling_descs
+                            else:
+                                incomplete_reason = "incomplete_tp_rank_descriptors"
+                                logging.warning(
+                                    "remote_g2: TP resolve failed closed; "
+                                    "rank %d returned %d/%d descriptors",
+                                    sibling,
+                                    len(sibling_descs or []),
+                                    expected_blocks,
+                                )
+                                break
+                        if incomplete_reason is None and set(per_rank_descs) != expected_ranks:
+                            incomplete_reason = "incomplete_tp_rank_descriptors"
+
+                        # Attach per-rank source metadata from S1. Every TP rank
+                        # needs its matching source agent metadata; falling back
+                        # to rank 0 would read the wrong KV shard.
+                        per_rank_bundles = get_per_rank_nixl_bundles()
+                        per_rank_meta = {
+                            entry["tp_rank"]: entry
+                            for entry in (per_rank_bundles or [])
+                        }
+                        if incomplete_reason is None and set(per_rank_meta) != expected_ranks:
+                            incomplete_reason = "incomplete_tp_rank_metadata"
+                            logging.warning(
+                                "remote_g2: TP resolve failed closed; "
+                                "metadata ranks=%s expected=%s",
+                                sorted(per_rank_meta),
+                                sorted(expected_ranks),
+                            )
+
+                        if incomplete_reason is not None:
+                            if result.lease_id is not None:
+                                registry.release_lease(result.lease_id, incomplete_reason)
+                            result_dict.update({
+                                "lease_id": None,
+                                "descriptors": [],
+                                "num_tokens": 0,
+                                "reason": incomplete_reason,
+                                "per_rank_descriptors": {},
+                                "per_rank_source_metadata": {},
+                            })
+                            response = {"ok": True, "result": result_dict}
+                            rep.send(pickle.dumps(response))
+                            continue
+
                         result_dict["per_rank_descriptors"] = per_rank_descs
                         logging.info(
                             "remote_g2: intra-pod gather: %d ranks, "
@@ -433,13 +481,7 @@ def _start_zmq_rep_service(
                             len(block_hashes),
                         )
 
-                        # Attach per-rank source metadata from S1.
-                        per_rank_bundles = get_per_rank_nixl_bundles()
-                        if per_rank_bundles:
-                            result_dict["per_rank_source_metadata"] = {
-                                entry["tp_rank"]: entry
-                                for entry in per_rank_bundles
-                            }
+                        result_dict["per_rank_source_metadata"] = per_rank_meta
 
                     response = {"ok": True, "result": result_dict}
                 elif method == "release_lease":
@@ -589,6 +631,15 @@ def _resolve_source_identity() -> Optional[tuple[int, int]]:
         return worker_id, dynamo_pid
     except Exception:
         return None
+
+
+def is_remote_g2_configured() -> bool:
+    """Return whether this engine subprocess is expected to run remote-G2.
+
+    MPI-spawned ranks may lose the original env var, so use the same env/sidecar
+    identity resolution as source bootstrap instead of checking os.environ only.
+    """
+    return _resolve_source_identity() is not None
 
 
 def _get_secondary_pool(kv: Any) -> Any:
@@ -816,7 +867,7 @@ def maybe_start_remote_g2_service(
 
     # PyExecutor.kv_cache_manager is a Python wrapper class
     # (resource_manager.KVCacheManager); the C++ binding with
-    # get_secondary_pool_data / find_and_pin_blocks_by_hash / pin_blocks_by_id
+    # get_secondary_pool_data / find_and_pin_blocks_by_hash
     # sits at .impl. Unwrap once so the rest of the code (and the
     # SourceG2DescriptorRegistry it builds) talks to the C++ object
     # directly.
@@ -901,6 +952,7 @@ def maybe_start_remote_g2_service(
             "remote_g2: failed to start ZMQ REP service; registry built but "
             "not reachable"
         )
+        raise
 
     # Stage T1 — bootstrap the NIXL agent and register the host_pinned
     # secondary pool. Each TP rank builds its own agent with a rank-
@@ -943,6 +995,7 @@ def maybe_start_remote_g2_service(
                 "remote_g2: NIXL source agent bootstrap failed; "
                 "resolve will still work, but transfer is disabled"
             )
+            raise RuntimeError("remote_g2: NIXL source agent bootstrap failed")
 
     # S1 — exchange per-rank NIXL metadata symmetrically. Every rank reaches
     # this call regardless of whether its own bundle built, so a one-sided

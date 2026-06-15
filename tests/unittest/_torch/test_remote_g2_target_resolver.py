@@ -70,17 +70,13 @@ PRIMARY_POOL_BASE_PTR = 0x20_0000_0000
 
 
 class _FakeKvCacheManager:
-    def __init__(self, pin_locations):
-        self._pin_locations = dict(pin_locations)
-        self.pin_calls: list[list[int]] = []
-        self.unpin_calls: list[list[int]] = []
+    def __init__(self, slot_locations):
+        self._slot_locations = dict(slot_locations)
+        self.slot_calls: list[tuple[int, int]] = []
 
-    def pin_blocks_by_id(self, block_ids):
-        self.pin_calls.append(list(block_ids))
-        return [self._pin_locations[bid] for bid in block_ids]
-
-    def unpin_blocks_by_id(self, block_ids):
-        self.unpin_calls.append(list(block_ids))
+    def get_slot_idx_by_block_id(self, block_id, window_size):
+        self.slot_calls.append((int(block_id), int(window_size)))
+        return self._slot_locations[int(block_id)]
 
 
 def _make_plan(num_blocks):
@@ -151,21 +147,38 @@ def test_make_target_descriptor_resolver_rejects_invalid_inputs():
             fake_kv,
             primary_pool_base_ptr=PRIMARY_POOL_BASE_PTR,
             block_size_bytes=0,
+            window_size=16,
         )
     with pytest.raises(ValueError):
         make_target_descriptor_resolver(
             fake_kv,
             primary_pool_base_ptr=0,
             block_size_bytes=BLOCK_SIZE_BYTES,
+            window_size=16,
+        )
+    with pytest.raises(ValueError):
+        make_target_descriptor_resolver(
+            fake_kv,
+            primary_pool_base_ptr=PRIMARY_POOL_BASE_PTR,
+            block_size_bytes=BLOCK_SIZE_BYTES,
+            window_size=0,
+        )
+    with pytest.raises(ValueError):
+        make_target_descriptor_resolver(
+            object(),
+            primary_pool_base_ptr=PRIMARY_POOL_BASE_PTR,
+            block_size_bytes=BLOCK_SIZE_BYTES,
+            window_size=16,
         )
 
 
-def test_resolver_builds_target_descriptors_from_pinned_slots():
-    fake_kv = _FakeKvCacheManager({42: (5, 0), 43: (6, 0)})
+def test_resolver_builds_target_descriptors_from_non_pinning_slot_lookup():
+    fake_kv = _FakeKvCacheManager({42: 5, 43: 6})
     resolver = make_target_descriptor_resolver(
         fake_kv,
         primary_pool_base_ptr=PRIMARY_POOL_BASE_PTR,
         block_size_bytes=BLOCK_SIZE_BYTES,
+        window_size=16,
     )
     record = _make_record([42, 43])
     descriptors = list(resolver(record))
@@ -176,22 +189,21 @@ def test_resolver_builds_target_descriptors_from_pinned_slots():
     assert descriptors[0].memory_type == "VRAM"
     assert descriptors[1].ptr == PRIMARY_POOL_BASE_PTR + 6 * BLOCK_SIZE_BYTES
     assert descriptors[1].memory_type == "VRAM"
-    assert fake_kv.pin_calls == [[42], [43]]
-    assert fake_kv.unpin_calls == [[42], [43]]
+    assert fake_kv.slot_calls == [(42, 16), (43, 16)]
 
 
-def test_resolver_refuses_target_block_on_secondary_tier():
-    fake_kv = _FakeKvCacheManager({42: (5, 0), 43: (6, 1)})
+def test_resolver_refuses_failed_slot_lookup():
+    fake_kv = _FakeKvCacheManager({42: 5})
     resolver = make_target_descriptor_resolver(
         fake_kv,
         primary_pool_base_ptr=PRIMARY_POOL_BASE_PTR,
         block_size_bytes=BLOCK_SIZE_BYTES,
+        window_size=16,
     )
     record = _make_record([42, 43])
     with pytest.raises(RemoteG2TransferError):
         list(resolver(record))
-    assert fake_kv.pin_calls == [[42], [43]]
-    assert fake_kv.unpin_calls == [[42], [43]]
+    assert fake_kv.slot_calls == [(42, 16), (43, 16)]
 
 
 def test_resolver_rejects_invalid_target_block_id():
@@ -200,22 +212,22 @@ def test_resolver_rejects_invalid_target_block_id():
         fake_kv,
         primary_pool_base_ptr=PRIMARY_POOL_BASE_PTR,
         block_size_bytes=BLOCK_SIZE_BYTES,
+        window_size=16,
     )
     record = _make_record([-1])
     with pytest.raises(RemoteG2TransferError):
         list(resolver(record))
-    assert fake_kv.pin_calls == []
-    assert fake_kv.unpin_calls == []
+    assert fake_kv.slot_calls == []
 
 
-def test_resolver_pin_unpin_pair_per_block():
-    fake_kv = _FakeKvCacheManager({1: (1, 0), 2: (2, 0), 3: (3, 0)})
+def test_resolver_slot_lookup_per_block():
+    fake_kv = _FakeKvCacheManager({1: 1, 2: 2, 3: 3})
     resolver = make_target_descriptor_resolver(
         fake_kv,
         primary_pool_base_ptr=PRIMARY_POOL_BASE_PTR,
         block_size_bytes=BLOCK_SIZE_BYTES,
+        window_size=16,
     )
     record = _make_record([1, 2, 3])
     list(resolver(record))
-    assert fake_kv.pin_calls == [[1], [2], [3]]
-    assert fake_kv.unpin_calls == [[1], [2], [3]]
+    assert fake_kv.slot_calls == [(1, 16), (2, 16), (3, 16)]

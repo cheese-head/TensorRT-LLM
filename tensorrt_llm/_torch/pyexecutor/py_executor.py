@@ -655,34 +655,49 @@ class PyExecutor:
             # connector class stays unchanged.
             # TODO production: feature-gate via connector config rather than
             # unconditionally calling here.
+            remote_g2_configured = False
             try:
                 from .connectors.remote_g2_source_setup import (
+                    is_remote_g2_configured,
                     maybe_start_remote_g2_service,
                 )
-                maybe_start_remote_g2_service(
+                remote_g2_configured = is_remote_g2_configured()
+                source_registry = maybe_start_remote_g2_service(
                     self.kv_cache_manager,
                     tp_rank=self.dist.tp_rank,
                     tp_size=self.dist.tp_size,
                 )
+                if remote_g2_configured and source_registry is None:
+                    raise RuntimeError(
+                        "remote_g2: configured source service failed to start"
+                    )
             except Exception:
                 import logging
                 logging.exception(
-                    "remote_g2: service bootstrap raised; continuing"
+                    "remote_g2: service bootstrap raised"
                 )
+                if remote_g2_configured:
+                    raise
             try:
                 from .connectors.remote_g2_target_setup import (
                     maybe_start_remote_g2_target_client,
                 )
-                maybe_start_remote_g2_target_client(
+                target_started = maybe_start_remote_g2_target_client(
                     self.kv_cache_manager,
                     tp_rank=self.dist.tp_rank,
                     tp_size=self.dist.tp_size,
                 )
+                if remote_g2_configured and not target_started:
+                    raise RuntimeError(
+                        "remote_g2: configured target client failed to start"
+                    )
             except Exception:
                 import logging
                 logging.exception(
-                    "remote_g2: target client bootstrap raised; continuing"
+                    "remote_g2: target client bootstrap raised"
                 )
+                if remote_g2_configured:
+                    raise
             self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
             # For each of our layers, we need to register the pre/post hooks.

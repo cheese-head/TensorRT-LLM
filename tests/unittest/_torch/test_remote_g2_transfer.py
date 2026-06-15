@@ -23,6 +23,14 @@ _REMOTE_G2_TRANSFER_PATH = (
     / "connectors"
     / "remote_g2_transfer.py"
 )
+_REMOTE_G2_RAW_NIXL_PATH = (
+    _ROOT
+    / "tensorrt_llm"
+    / "_torch"
+    / "pyexecutor"
+    / "connectors"
+    / "remote_g2_raw_nixl_adapter.py"
+)
 _REMOTE_G2_OBSERVABILITY_PATH = (
     _ROOT
     / "tensorrt_llm"
@@ -64,10 +72,14 @@ def _load_transfer_modules():
     transfer = _load_module(
         f"{_CONNECTOR_PACKAGE}.remote_g2_transfer", _REMOTE_G2_TRANSFER_PATH
     )
-    return remote_g2, transfer
+    raw_nixl = _load_module(
+        f"{_CONNECTOR_PACKAGE}.remote_g2_raw_nixl_adapter",
+        _REMOTE_G2_RAW_NIXL_PATH,
+    )
+    return remote_g2, transfer, raw_nixl
 
 
-REMOTE_G2, TRANSFER = _load_transfer_modules()
+REMOTE_G2, TRANSFER, RAW_NIXL = _load_transfer_modules()
 
 
 # bind_target_blocks does a lazy `from .remote_g2_connector import
@@ -106,6 +118,7 @@ RemoteG2SourceMetadata = TRANSFER.RemoteG2SourceMetadata
 RemoteG2SourceMetadataCache = TRANSFER.RemoteG2SourceMetadataCache
 RemoteG2TransferDescriptor = TRANSFER.RemoteG2TransferDescriptor
 RemoteG2TransferError = TRANSFER.RemoteG2TransferError
+RawNixlRemoteG2Adapter = RAW_NIXL.RawNixlRemoteG2Adapter
 
 
 class FakeMemoryDescs:
@@ -210,11 +223,13 @@ def _source_descriptor(block_hash):
     )
 
 
-def _binding_record(num_computed_tokens=16):
+def _binding_record(num_computed_tokens=16, resolve_result=None):
     store = TargetRemoteG2BindingStore(release_lease=lambda lease_id, reason: True)
-    result = RemoteG2ResolveResult(
+    result = resolve_result or RemoteG2ResolveResult(
         lease_id="lease-1",
-        descriptors=tuple(_source_descriptor(block_hash) for block_hash in (11, 22, 33)),
+        descriptors=tuple(
+            _source_descriptor(block_hash) for block_hash in (11, 22, 33)
+        ),
         num_tokens=48,
         source_generation=99,
     )
@@ -226,6 +241,36 @@ def _binding_record(num_computed_tokens=16):
     )
     store.bind_target_blocks(1234, [100, 101, 102])
     return record
+
+
+def _raw_adapter_for_fail_closed_tests():
+    adapter = object.__new__(RawNixlRemoteG2Adapter)
+    adapter._local_rank = 1
+    adapter._source_metadata_fetcher = lambda worker_id, generation: {
+        "remote_name": "rank0",
+        "agent_metadata": b"rank0",
+        "pool_base_ptr": 0,
+        "pool_size_bytes": 4096,
+        "source_generation": generation,
+    }
+    adapter._ensure_peer_loaded = lambda source_meta: ("local", "remote")
+    adapter._agent = SimpleNamespace(
+        make_prepped_xfer=lambda *args, **kwargs: "handle",
+        transfer=lambda handle: "DONE",
+    )
+    adapter._block_size_bytes = 0
+    return adapter
+
+
+def _tp_resolve_result(*, per_rank_meta, per_rank_descs):
+    return RemoteG2ResolveResult(
+        lease_id="lease-1",
+        descriptors=tuple(_source_descriptor(block_hash) for block_hash in (11, 22, 33)),
+        num_tokens=48,
+        source_generation=99,
+        per_rank_source_metadata=per_rank_meta,
+        per_rank_descriptors=per_rank_descs,
+    )
 
 
 def _source_metadata(worker_id=7, generation=99):
@@ -250,6 +295,69 @@ def test_remote_g2_source_metadata_cache_refreshes_by_generation():
     assert cache.get_or_refresh(7, 100, fetch).source_generation == 100
 
     assert calls == [(7, 99), (7, 100)]
+
+
+def test_raw_nixl_adapter_rejects_missing_tp_rank_metadata():
+    record = _binding_record(
+        resolve_result=_tp_resolve_result(
+            per_rank_meta={
+                0: {
+                    "remote_name": "rank0",
+                    "agent_metadata": b"rank0",
+                    "pool_base_ptr": 0,
+                    "pool_size_bytes": 4096,
+                    "source_generation": 99,
+                }
+            },
+            per_rank_descs={1: [{"byte_offset": 0}, {"byte_offset": 4096}]},
+        )
+    )
+    adapter = _raw_adapter_for_fail_closed_tests()
+
+    with pytest.raises(RuntimeError, match="missing per-rank source metadata"):
+        adapter._start_transfer_impl(record, _nvtx=None)
+
+
+def test_raw_nixl_adapter_rejects_missing_tp_rank_descriptors():
+    record = _binding_record(
+        resolve_result=_tp_resolve_result(
+            per_rank_meta={
+                1: {
+                    "remote_name": "rank1",
+                    "agent_metadata": b"rank1",
+                    "pool_base_ptr": 0,
+                    "pool_size_bytes": 4096,
+                    "source_generation": 99,
+                }
+            },
+            per_rank_descs={0: [{"byte_offset": 0}, {"byte_offset": 4096}]},
+        )
+    )
+    adapter = _raw_adapter_for_fail_closed_tests()
+
+    with pytest.raises(RuntimeError, match="missing per-rank descriptors"):
+        adapter._start_transfer_impl(record, _nvtx=None)
+
+
+def test_raw_nixl_adapter_rejects_incomplete_tp_rank_descriptors():
+    record = _binding_record(
+        resolve_result=_tp_resolve_result(
+            per_rank_meta={
+                1: {
+                    "remote_name": "rank1",
+                    "agent_metadata": b"rank1",
+                    "pool_base_ptr": 0,
+                    "pool_size_bytes": 4096,
+                    "source_generation": 99,
+                }
+            },
+            per_rank_descs={1: [{"byte_offset": 0}]},
+        )
+    )
+    adapter = _raw_adapter_for_fail_closed_tests()
+
+    with pytest.raises(RuntimeError, match="incomplete per-rank descriptors"):
+        adapter._start_transfer_impl(record, _nvtx=None)
 
 
 def test_remote_g2_transfer_adapter_submits_one_read_for_bound_prefix():

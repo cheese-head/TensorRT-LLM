@@ -390,8 +390,7 @@ def test_make_kv_pin_callbacks_rejects_invalid_inputs():
         )
 
 
-def test_acquire_pin_success_refreshes_record_to_post_pin_slot():
-    # Block was at slot 5 at event time, but pin reports it's now at slot 9.
+def test_acquire_pin_accepts_find_and_pin_record_without_by_id_pin():
     fake_kv = _FakeKvCacheManager({42: (9, 1)})
     acquire, _ = make_kv_pin_callbacks(
         fake_kv,
@@ -399,19 +398,15 @@ def test_acquire_pin_success_refreshes_record_to_post_pin_slot():
         block_size_bytes=BLOCK_SIZE_BYTES,
     )
     record = _build_record(block_id=42, slot_idx=5)
+    record._pinned_by_lookup = True
     pin_ref = acquire(record, "lease-xyz")
     assert pin_ref == 42
-    assert record.byte_offset == 9 * BLOCK_SIZE_BYTES
-    assert (
-        record.metadata["nixl_memory_desc"]["ptr"]
-        == POOL_BASE_PTR + 9 * BLOCK_SIZE_BYTES
-    )
-    assert fake_kv.pin_calls == [[42]]
+    assert record.byte_offset == 5 * BLOCK_SIZE_BYTES
+    assert fake_kv.pin_calls == []
     assert fake_kv.unpin_calls == []
 
 
-def test_acquire_pin_on_primary_unpins_and_raises():
-    # Pin reports the block migrated to primary (level 0) between event and pin.
+def test_acquire_pin_rejects_event_only_record_without_by_id_pin():
     fake_kv = _FakeKvCacheManager({42: (3, 0)})
     acquire, _ = make_kv_pin_callbacks(
         fake_kv,
@@ -421,8 +416,8 @@ def test_acquire_pin_on_primary_unpins_and_raises():
     record = _build_record(block_id=42, slot_idx=5)
     with pytest.raises(RuntimeError):
         acquire(record, "lease-xyz")
-    assert fake_kv.pin_calls == [[42]]
-    assert fake_kv.unpin_calls == [[42]]
+    assert fake_kv.pin_calls == []
+    assert fake_kv.unpin_calls == []
 
 
 def test_acquire_pin_invalid_block_id_raises_without_calling_kv():
@@ -480,8 +475,12 @@ def test_acquire_pin_then_release_round_trips_through_registry():
         acquire_pin=acquire,
         release_pin=release,
     )
-    registry.upsert_descriptor(_build_record(block_hash=111, block_id=42, slot_idx=5))
-    registry.upsert_descriptor(_build_record(block_hash=222, block_id=43, slot_idx=6))
+    record_111 = _build_record(block_hash=111, block_id=42, slot_idx=5)
+    record_111._pinned_by_lookup = True
+    record_222 = _build_record(block_hash=222, block_id=43, slot_idx=6)
+    record_222._pinned_by_lookup = True
+    registry.upsert_descriptor(record_111)
+    registry.upsert_descriptor(record_222)
 
     import time
 
@@ -505,7 +504,7 @@ def test_acquire_pin_then_release_round_trips_through_registry():
     result = registry.resolve_and_lease(plan)
     assert result.lease_id is not None
     assert len(result.descriptors) == 2
-    assert fake_kv.pin_calls == [[42], [43]]
+    assert fake_kv.pin_calls == []
     assert fake_kv.unpin_calls == []
 
     assert registry.release_lease(result.lease_id, "test_done")

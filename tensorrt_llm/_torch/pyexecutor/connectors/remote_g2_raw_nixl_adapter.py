@@ -355,12 +355,18 @@ class RawNixlRemoteG2Adapter:
         resolve_result = record.resolve_result
         per_rank_meta = getattr(resolve_result, "per_rank_source_metadata", {})
         per_rank_descs = getattr(resolve_result, "per_rank_descriptors", {})
+        has_tp_payload = bool(per_rank_meta) or bool(per_rank_descs)
 
         # Source metadata — drives add_remote_agent + remote dlist.
         if _nvtx is not None:
             _nvtx.range_push("remote_g2 metadata fetch")
         try:
-            if per_rank_meta and my_rank in per_rank_meta:
+            if has_tp_payload:
+                if my_rank not in per_rank_meta:
+                    raise RuntimeError(
+                        "remote_g2: missing per-rank source metadata for "
+                        f"tp_rank={my_rank}; refusing rank-0 fallback"
+                    )
                 # TP>1: use this rank's source metadata directly.
                 source_meta = per_rank_meta[my_rank]
                 logging.info(
@@ -398,18 +404,31 @@ class RawNixlRemoteG2Adapter:
         local_indices: list[int] = []
         remote_indices: list[int] = []
 
-        if per_rank_descs and my_rank in per_rank_descs:
+        if has_tp_payload:
+            if my_rank not in per_rank_descs:
+                raise RuntimeError(
+                    "remote_g2: missing per-rank descriptors for "
+                    f"tp_rank={my_rank}; refusing rank-0 fallback"
+                )
             # TP>1: this rank's descriptors from the per-rank gather.
             rank_descs = per_rank_descs[my_rank]
+            if len(rank_descs) != len(record.bound_blocks):
+                raise RuntimeError(
+                    "remote_g2: incomplete per-rank descriptors for "
+                    f"tp_rank={my_rank}: {len(rank_descs)}/"
+                    f"{len(record.bound_blocks)}"
+                )
             for i, block in enumerate(record.bound_blocks):
                 slot_idx = int(getattr(block, "target_slot_idx", -1))
                 if slot_idx < 0:
                     slot_idx = int(block.target_block_id)
                 local_indices.append(slot_idx)
-                if i < len(rank_descs) and rank_descs[i] is not None:
-                    src_offset = int(rank_descs[i].get("byte_offset", 0))
-                else:
-                    src_offset = int(block.source_descriptor.byte_offset)
+                if rank_descs[i] is None:
+                    raise RuntimeError(
+                        "remote_g2: null per-rank descriptor for "
+                        f"tp_rank={my_rank} block_index={i}"
+                    )
+                src_offset = int(rank_descs[i].get("byte_offset", 0))
                 remote_indices.append(src_offset // block_size)
         else:
             # TP=1: use bound_blocks directly.

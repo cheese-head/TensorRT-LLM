@@ -8,30 +8,30 @@ from typing import Any, Callable, Sequence
 from .remote_g2 import RemoteG2BindingRecord
 from .remote_g2_transfer import RemoteG2TransferDescriptor, RemoteG2TransferError
 
-_PRIMARY_CACHE_LEVEL = 0
-_SECONDARY_CACHE_LEVEL = 1
-
-
 def make_target_descriptor_resolver(
     kv_cache_manager: Any,
     *,
     primary_pool_base_ptr: int,
     block_size_bytes: int,
+    window_size: int,
     device_id: int = 0,
     name_prefix: str = "g2-target",
 ) -> Callable[[RemoteG2BindingRecord], Sequence[RemoteG2TransferDescriptor]]:
     """Build a target_descriptor_resolver for RemoteG2NixlTransferAdapter.
 
-    Reads the authoritative slot of each target_block_id via a pin/unpin
-    pair (the block is already refcount-held by the admitted request, so
-    the +1/-1 here does not affect residency). Refuses to produce a
-    descriptor for any block that the pin reports on the secondary tier,
-    since the NIXL adapter expects target descriptors to live in VRAM.
+    Reads the authoritative primary-pool slot of each target_block_id through
+    the non-pinning KVCM accessor. Do not use pin_blocks_by_id here: by-id
+    pinning can bypass radix-tree visibility and is intentionally disabled for
+    remote-G2 on the PR #6 KVCM baseline.
     """
     if block_size_bytes <= 0:
         raise ValueError("block_size_bytes must be positive")
     if primary_pool_base_ptr <= 0:
         raise ValueError("primary_pool_base_ptr must be a non-zero address")
+    if window_size <= 0:
+        raise ValueError("window_size must be positive")
+    if not hasattr(kv_cache_manager, "get_slot_idx_by_block_id"):
+        raise ValueError("kv_cache_manager must expose get_slot_idx_by_block_id")
 
     def resolver(
         record: RemoteG2BindingRecord,
@@ -44,20 +44,20 @@ def make_target_descriptor_resolver(
                     f"target block_id {block_id} is invalid"
                 )
 
-            locations = kv_cache_manager.pin_blocks_by_id([block_id])
-            if not locations:
-                raise RemoteG2TransferError(
-                    f"pin_blocks_by_id returned no location for block_id={block_id}"
+            try:
+                slot_idx = int(
+                    kv_cache_manager.get_slot_idx_by_block_id(
+                        block_id, int(window_size)
+                    )
                 )
-            slot_idx, cache_level = locations[0]
-            slot_idx = int(slot_idx)
-            cache_level = int(cache_level)
-            kv_cache_manager.unpin_blocks_by_id([block_id])
-
-            if cache_level != _PRIMARY_CACHE_LEVEL:
+            except Exception as exc:
                 raise RemoteG2TransferError(
-                    f"target block_id={block_id} pinned on cache_level={cache_level}, "
-                    f"expected {_PRIMARY_CACHE_LEVEL} (primary VRAM)"
+                    f"target slot lookup failed for block_id={block_id}"
+                ) from exc
+            if slot_idx < 0:
+                raise RemoteG2TransferError(
+                    f"target slot lookup returned invalid slot {slot_idx} "
+                    f"for block_id={block_id}"
                 )
 
             ptr = primary_pool_base_ptr + slot_idx * block_size_bytes
