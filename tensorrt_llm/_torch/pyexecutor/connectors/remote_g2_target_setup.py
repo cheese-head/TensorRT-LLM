@@ -141,8 +141,7 @@ def _empty_result(reason: str) -> RemoteG2ResolveResult:
 def _make_resolve_callable(wrapper: _TargetReqWrapper):
     def _resolve(plan: RemoteKvReusePlan) -> RemoteG2ResolveResult:
         logging.warning(
-            "PROBE rpc_chain target_resolve_callable pid=%d plan_id=%s "
-            "source_worker_id=%s",
+            "PROBE rpc_chain target_resolve_callable pid=%d plan_id=%s source_worker_id=%s",
             os.getpid(),
             plan.plan_id,
             plan.source_worker_id,
@@ -230,9 +229,7 @@ def _make_source_metadata_fetcher(wrapper: _TargetReqWrapper, peer_info_provider
         try:
             response = wrapper.request("metadata", payload)
         except Exception as exc:
-            raise RemoteG2TransferError(
-                f"metadata RPC raised: {exc!r}"
-            ) from exc
+            raise RemoteG2TransferError(f"metadata RPC raised: {exc!r}") from exc
         if not isinstance(response, dict) or not response.get("ok"):
             err = response.get("error") if isinstance(response, dict) else "non_dict"
             raise RemoteG2TransferError(f"metadata RPC not ok: {err}")
@@ -246,6 +243,7 @@ def _make_source_metadata_fetcher(wrapper: _TargetReqWrapper, peer_info_provider
         # Source encodes agent_desc bytes as base64 over the dynamo wire;
         # decode back to raw bytes before handing to the NIXL adapter.
         import base64 as _b64
+
         agent_desc_b64 = inner.get("agent_desc_b64")
         if agent_desc_b64 is not None:
             agent_desc = _b64.b64decode(agent_desc_b64)
@@ -321,8 +319,8 @@ def _make_target_descriptor_resolver(
                 int(device_id),
                 int(block_size_bytes),
                 int(head_src.metadata.get("nixl_memory_desc", {}).get("ptr", 0))
-                  if isinstance(head_src.metadata.get("nixl_memory_desc"), dict)
-                  else 0,
+                if isinstance(head_src.metadata.get("nixl_memory_desc"), dict)
+                else 0,
                 int(head_src.byte_length),
                 str(head_src.pool_id),
                 head_tgt.ptr,
@@ -362,7 +360,8 @@ def _build_listening_nixl_agent(name: str):
     agent.name = name
     logging.warning(
         "PROBE remote_g2_target_listening_agent: name=%s connection_info=%s",
-        name, agent.get_local_connection_info(),
+        name,
+        agent.get_local_connection_info(),
     )
     return agent
 
@@ -388,6 +387,7 @@ class _ConnectionInfoNixlAdapter:
 
     def __init__(self, _peer_info_state=None, **kwargs):
         from .remote_g2_transfer import RemoteG2NixlTransferAdapter
+
         # Pop our adapter-only kwarg before forwarding to upstream.
         self._peer_info_state = _peer_info_state or {"peer_name": "", "peer_conn": ""}
         # Override agent_factory so the upstream adapter builds an agent
@@ -408,6 +408,7 @@ class _ConnectionInfoNixlAdapter:
             RemoteG2TransferError,
             RemoteG2TransferResult,
         )
+
         if not record.is_transfer_ready:
             raise RemoteG2TransferError("remote G2 binding is not transfer-ready")
 
@@ -460,20 +461,18 @@ class _ConnectionInfoNixlAdapter:
             logging.warning(
                 "PROBE rpc_chain target_load_remote_by_connection name=%s connection_info=%s "
                 "(peer_handshake target=%s -> source=%s)",
-                source_metadata.remote_name, connection_info,
-                self._inner._local_peer_name, source_metadata.remote_name,
+                source_metadata.remote_name,
+                connection_info,
+                self._inner._local_peer_name,
+                source_metadata.remote_name,
             )
-            agent.load_remote_agent_by_connection(
-                source_metadata.remote_name, connection_info
-            )
+            agent.load_remote_agent_by_connection(source_metadata.remote_name, connection_info)
             self._loaded_remote_agents.add(key)
         elif not connection_info:
             logging.warning(
                 "remote_g2: no connection_info from source — falling back to bytes load (may fail at createXferReq)"
             )
-            agent.load_remote_agent(
-                source_metadata.remote_name, source_metadata.agent_desc
-            )
+            agent.load_remote_agent(source_metadata.remote_name, source_metadata.agent_desc)
 
         # Step 4 — Register the target VRAM blocks just-in-time.
         target_registration = types.RegMemoryDescs(
@@ -491,7 +490,8 @@ class _ConnectionInfoNixlAdapter:
         status = agent.submit_transfer_requests(request)
         logging.warning(
             "PROBE rpc_chain nixl_read_submitted request_id=%s blocks=%d",
-            record.request_id, len(source_descs),
+            record.request_id,
+            len(source_descs),
         )
         return RemoteG2TransferResult(
             record=record,
@@ -626,9 +626,7 @@ def _build_target_nixl_adapter(
     # adapter to pre-register the entire pool at construction (rather
     # than registering each block just-in-time).
     try:
-        primary_pool_size_bytes = int(
-            primary_pool.element_size() * primary_pool.numel()
-        )
+        primary_pool_size_bytes = int(primary_pool.element_size() * primary_pool.numel())
     except Exception:
         logging.exception("remote_g2: failed to compute primary pool size")
         return None
@@ -640,6 +638,7 @@ def _build_target_nixl_adapter(
     # its own metadata bytes.
     def _raw_metadata_fetcher(source_worker_id: int, source_generation: int) -> dict:
         import base64 as _b64
+
         # The local NIXL agent for the raw adapter isn't yet available
         # at this point (the adapter populates _local_peer_metadata_b64
         # on construction). We rely on the adapter setting it via the
@@ -682,6 +681,7 @@ def _build_target_nixl_adapter(
         # Populate our own metadata bytes for the bidirectional
         # handshake so the source can add_remote_agent on us.
         import base64 as _b64
+
         adapter_state["peer_metadata_b64"] = _b64.b64encode(
             adapter._agent.get_agent_metadata()
         ).decode("ascii")
@@ -731,8 +731,7 @@ def maybe_start_remote_g2_target_client(kv: Optional[Any] = None) -> bool:
     dynamo_pid = _walk_to_dynamo_worker_pid()
     if dynamo_pid is None:
         logging.info(
-            "remote_g2: target client skipped "
-            "(dynamo parent not reachable from engine subprocess)"
+            "remote_g2: target client skipped (dynamo parent not reachable from engine subprocess)"
         )
         return False
 
@@ -781,18 +780,14 @@ def maybe_start_remote_g2_target_client(kv: Optional[Any] = None) -> bool:
         if not block_ids or window_size is None:
             return []
         try:
-            return [
-                int(kv.get_slot_idx_by_block_id(int(b), int(window_size)))
-                for b in block_ids
-            ]
+            return [int(kv.get_slot_idx_by_block_id(int(b), int(window_size))) for b in block_ids]
         except Exception:
             return []
 
     remote_g2_connector.install_block_id_to_slot_idx(_block_id_to_slot_idx)
 
     logging.warning(
-        "remote_g2: target client installed "
-        "(socket=%s own_worker_id=%s)",
+        "remote_g2: target client installed (socket=%s own_worker_id=%s)",
         socket_path,
         own_worker_id,
     )
@@ -802,9 +797,7 @@ def maybe_start_remote_g2_target_client(kv: Optional[Any] = None) -> bool:
     # worker reads these from module state at start_load_kv time, so
     # installation order vs. worker construction doesn't matter.
     if kv is None:
-        logging.info(
-            "remote_g2: transfer adapter not installed (kv_cache_manager not passed)"
-        )
+        logging.info("remote_g2: transfer adapter not installed (kv_cache_manager not passed)")
         return True
 
     # Mirror the source-side .impl unwrap; we need the C++ binding for
